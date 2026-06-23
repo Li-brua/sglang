@@ -354,6 +354,19 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.num_real_reqs[0] = rpi.shape[0]
         return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id)
 
+    def _resolve_decode_topk_device_locs(
+        self,
+        rpi: torch.Tensor,
+        sls: torch.Tensor,
+        batch: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Wrapper that sets num_real_reqs before resolving decode top-k locs."""
+        self.coordinator.num_real_reqs[0] = rpi.shape[0]
+        return self.coordinator.resolve_decode_topk_device_locs(
+            rpi, sls, batch, layer_id
+        )
+
     def _cleanup_req(self, req, kv_loc, *, logical_only=False):
         """request_finished -> free KV -> free req slot."""
         self.coordinator.request_finished(req)
@@ -677,7 +690,7 @@ class TestHiSparseUnit(unittest.TestCase):
         tokens = self._build_topk_tokens(fill_len)
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [fill_len])
-        locs = self.coordinator.resolve_decode_topk_device_locs(rpi, sls, batch, 0)
+        locs = self._resolve_decode_topk_device_locs(rpi, sls, batch, 0)
         valid_n = min(fill_len, TOP_K)
         self.assertTrue(torch.all(locs[0, :valid_n] >= 0))
         self._assert_kv_correct(
@@ -733,7 +746,7 @@ class TestHiSparseUnit(unittest.TestCase):
         tokens = self._build_topk_tokens(seq_len, include_newest=True)
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [seq_len])
-        locs = self.coordinator.resolve_decode_topk_device_locs(rpi, sls, batch, 0)
+        locs = self._resolve_decode_topk_device_locs(rpi, sls, batch, 0)
         valid_n = min(seq_len, TOP_K)
         self.assertTrue(torch.all(locs[0, :valid_n] >= 0))
         self._assert_kv_correct(
@@ -771,7 +784,7 @@ class TestHiSparseUnit(unittest.TestCase):
         tokens = self._build_topk_tokens(fill_len - 1)
         batch = tokens.unsqueeze(0)
         rpi, sls = self._make_batch_tensors([req], [fill_len])
-        locs = self.coordinator.resolve_decode_topk_device_locs(rpi, sls, batch, 0)
+        locs = self._resolve_decode_topk_device_locs(rpi, sls, batch, 0)
         self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
         self._assert_kv_correct(
             locs[0], tokens, layer_id=0, count=TOP_K, msg="Demoted: "
