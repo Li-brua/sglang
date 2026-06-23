@@ -122,9 +122,7 @@ from sglang.srt.layers.attention.attention_registry import (
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.cp.utils import (
-    get_cp_strategy,
-)
+from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     initialize_dp_attention,
@@ -838,6 +836,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                enable_memory_aware_resident=hisparse_cfg.enable_memory_aware_resident,
+                resident_high_watermark=hisparse_cfg.resident_high_watermark,
+                resident_low_watermark=hisparse_cfg.resident_low_watermark,
             )
 
         self.init_routed_experts_capturer()

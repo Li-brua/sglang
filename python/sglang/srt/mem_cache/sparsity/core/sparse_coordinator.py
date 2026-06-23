@@ -58,6 +58,9 @@ class SparseConfig:
     top_k: int = 2048
     device_buffer_size: int = 4096
     host_to_device_ratio: int = 2
+    enable_memory_aware_resident: bool = False
+    resident_high_watermark: float = 0.85
+    resident_low_watermark: float = 0.70
     algorithm: Optional[str] = None
     backend: Optional[str] = None
     page_size: Optional[int] = None

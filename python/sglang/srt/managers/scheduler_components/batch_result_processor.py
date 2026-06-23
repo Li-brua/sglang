@@ -241,7 +241,7 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                            self.hisparse_coordinator.admit_request_memory_aware(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -738,6 +738,9 @@ class SchedulerBatchResultProcessor:
                     # here; spec already advanced it in _resolve_spec_v2_tokens.
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
+
+        if self.server_args.enable_hisparse:
+            self.hisparse_coordinator.demote_resident_reqs_for_pressure(batch.reqs)
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

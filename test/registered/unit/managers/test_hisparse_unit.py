@@ -178,7 +178,14 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
+        self.coordinator.ready_resident_reqs.clear()
         self.coordinator._has_pending_backup = False
+        self.coordinator.enable_memory_aware_resident = False
+        self.coordinator.resident_high_watermark = 0.85
+        self.coordinator.resident_low_watermark = 0.70
+        self.coordinator.req_resident.zero_()
+        for i in range(len(self.coordinator.req_resident_cpu)):
+            self.coordinator.req_resident_cpu[i] = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 
@@ -642,6 +649,164 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "staging_path")
+
+    def test_memory_aware_resident_path_skips_host_staging(self):
+        """Low-pressure memory-aware admission keeps full KV resident in HBM."""
+        initial = self._get_initial_sizes()
+        self.coordinator.enable_memory_aware_resident = True
+        self.coordinator.resident_high_watermark = 1.0
+
+        fill_len = self.page_size * 2
+        req = _make_req("resident-req", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+
+        mode = self.coordinator.admit_request_memory_aware(req)
+        self.assertEqual(mode, "resident")
+        self.assertFalse(req.hisparse_staging)
+        self.assertTrue(self.coordinator.is_resident_req(req))
+        self.assertEqual(
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]), 0
+        )
+        self.assertEqual(self.coordinator.mem_pool_host.available_size(), initial[2])
+
+        ready = self.coordinator.collect_ready_reqs()
+        self.assertEqual(ready, [req])
+
+        tokens = self._build_topk_tokens(fill_len)
+        batch = tokens.unsqueeze(0)
+        rpi, sls = self._make_batch_tensors([req], [fill_len])
+        locs = self.coordinator.resolve_decode_topk_device_locs(rpi, sls, batch, 0)
+        valid_n = min(fill_len, TOP_K)
+        self.assertTrue(torch.all(locs[0, :valid_n] >= 0))
+        self._assert_kv_correct(
+            locs[0], tokens, layer_id=0, count=valid_n, msg="Resident: "
+        )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "resident_path")
+
+    def test_memory_aware_resident_decode_maps_new_token(self):
+        """Resident decode allocates HBM mapping for the newly generated token."""
+        initial = self._get_initial_sizes()
+        self.coordinator.enable_memory_aware_resident = True
+        self.coordinator.resident_high_watermark = 1.0
+
+        fill_len = self.page_size
+        seq_len = fill_len + 1
+        req = _make_req("resident-decode", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+
+        self.assertEqual(self.coordinator.admit_request_memory_aware(req), "resident")
+        self.coordinator.collect_ready_reqs()
+
+        out_loc = self.allocator.alloc_decode(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device="cuda"),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+            last_loc=kv_loc[-1:],
+        )
+        self.assertIsNotNone(out_loc)
+        self.req_to_token_pool.write((req.req_pool_idx, fill_len), out_loc)
+        req.kv_allocated_len = seq_len
+        req.kv_committed_len = seq_len
+
+        self.coordinator.map_last_loc_to_buffer(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device="cuda"),
+            out_cache_loc=out_loc,
+            req_pool_indices=torch.tensor(
+                [req.req_pool_idx], dtype=torch.int64, device="cuda"
+            ),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([req.req_pool_idx], dtype=torch.int64),
+        )
+
+        new_device_loc = self.allocator.full_to_hisparse_device_index_mapping[out_loc]
+        self.assertTrue(torch.all(new_device_loc > 0))
+        for lid in range(LAYER_NUM):
+            self.device_pool.kv_buffer[lid][new_device_loc.long()] = self._kv_pattern(
+                lid, fill_len
+            )
+
+        tokens = self._build_topk_tokens(seq_len, include_newest=True)
+        batch = tokens.unsqueeze(0)
+        rpi, sls = self._make_batch_tensors([req], [seq_len])
+        locs = self.coordinator.resolve_decode_topk_device_locs(rpi, sls, batch, 0)
+        valid_n = min(seq_len, TOP_K)
+        self.assertTrue(torch.all(locs[0, :valid_n] >= 0))
+        self._assert_kv_correct(
+            locs[0], tokens, layer_id=0, count=valid_n, msg="Resident decode: "
+        )
+
+        self._cleanup_req(req, torch.cat([kv_loc, out_loc]))
+        self._assert_sizes_restored(initial, "resident_decode")
+
+    def test_memory_aware_demotes_resident_request(self):
+        """Resident requests can be converted to the normal host-backed layout."""
+        initial = self._get_initial_sizes()
+        self.coordinator.enable_memory_aware_resident = True
+        self.coordinator.resident_high_watermark = 1.0
+
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size
+        req = _make_req("resident-demote", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+
+        self.assertEqual(self.coordinator.admit_request_memory_aware(req), "resident")
+        self.coordinator.collect_ready_reqs()
+
+        demoted = self.coordinator.demote_resident_request(req)
+        self.assertTrue(demoted)
+        self.assertFalse(self.coordinator.is_resident_req(req))
+        self.assertGreater(
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]), 0
+        )
+        self.assertGreater(
+            int(self.coordinator.req_device_buffer_size[req.req_pool_idx]), 0
+        )
+
+        tokens = self._build_topk_tokens(fill_len - 1)
+        batch = tokens.unsqueeze(0)
+        rpi, sls = self._make_batch_tensors([req], [fill_len])
+        locs = self.coordinator.resolve_decode_topk_device_locs(rpi, sls, batch, 0)
+        self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
+        self._assert_kv_correct(
+            locs[0], tokens, layer_id=0, count=TOP_K, msg="Demoted: "
+        )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "resident_demote")
+
+    def test_memory_aware_demotes_resident_reqs_under_pressure(self):
+        """Watermark pressure converts resident requests to host-backed layout."""
+        initial = self._get_initial_sizes()
+        self.coordinator.enable_memory_aware_resident = True
+        self.coordinator.resident_high_watermark = 1.0
+
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size
+        req = _make_req("resident-pressure-demote", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+
+        self.assertEqual(self.coordinator.admit_request_memory_aware(req), "resident")
+        self.coordinator.collect_ready_reqs()
+        self.assertTrue(self.coordinator.is_resident_req(req))
+
+        self.coordinator.resident_high_watermark = 0.0
+        self.coordinator.resident_low_watermark = 0.0
+        demoted = self.coordinator.demote_resident_reqs_for_pressure([req])
+        self.assertEqual(demoted, 1)
+        self.assertFalse(self.coordinator.is_resident_req(req))
+        self.assertGreater(
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]), 0
+        )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "resident_pressure_demote")
 
     # ==================================================================
     # Test: Single-node staging host page allocation

@@ -148,6 +148,37 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    def test_hisparse_memory_aware_resident_config(self):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        cfg = parse_hisparse_config(
+            SimpleNamespace(
+                hisparse_config=(
+                    '{"enable_memory_aware_resident": true, '
+                    '"resident_high_watermark": 0.9, '
+                    '"resident_low_watermark": 0.6}'
+                )
+            )
+        )
+
+        self.assertTrue(cfg.enable_memory_aware_resident)
+        self.assertEqual(cfg.resident_high_watermark, 0.9)
+        self.assertEqual(cfg.resident_low_watermark, 0.6)
+
+    def test_hisparse_memory_aware_resident_rejects_bad_watermarks(self):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        with self.assertRaisesRegex(ValueError, "resident watermarks"):
+            parse_hisparse_config(
+                SimpleNamespace(
+                    hisparse_config=(
+                        '{"enable_memory_aware_resident": true, '
+                        '"resident_high_watermark": 0.5, '
+                        '"resident_low_watermark": 0.9}'
+                    )
+                )
+            )
+
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
         server_args = ServerArgs(model_path="dummy", enable_hisparse=True)

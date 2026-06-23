@@ -1798,7 +1798,7 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if self.hisparse_coordinator is not None:
-            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+            page_table_1 = self.hisparse_coordinator.resolve_decode_topk_device_locs(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 topk_indices,
