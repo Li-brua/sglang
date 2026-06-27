@@ -357,6 +357,9 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
                 pool_transfers = None
 
         io_backend = getattr(self.cache_controller, "io_backend", "kernel")
+        transfer_host_indices = host_indices
+        transfer_device_indices = device_indices
+        transfer_pool_transfers = pool_transfers
         if io_backend == "direct":
             total_len = len(device_indices)
             if total_len % self.page_size != 0:
@@ -365,15 +368,44 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
                     f"indices, got {total_len} tokens with page_size={self.page_size}."
                 )
 
+            def host_to_cpu(indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+                if indices is not None and indices.is_cuda:
+                    return indices.cpu()
+                return indices
+
+            op_pool_transfers = None
+            if pool_transfers is not None:
+                op_pool_transfers = [
+                    PoolTransfer(
+                        name=transfer.name,
+                        host_indices=host_to_cpu(transfer.host_indices),
+                        device_indices=transfer.device_indices,
+                        keys=transfer.keys,
+                        hit_policy=transfer.hit_policy,
+                        indices_from_pool=transfer.indices_from_pool,
+                    )
+                    for transfer in pool_transfers
+                ]
+            transfer_host_indices, transfer_device_indices, transfer_pool_transfers = (
+                self.cache_controller.move_hybrid_indices(
+                    CacheOperation(
+                        host_indices=host_to_cpu(host_indices),
+                        device_indices=device_indices,
+                        node_id=-1,
+                        pool_transfers=op_pool_transfers,
+                    )
+                )
+            )
+
         self.host_pool_group.backup_from_device_all_layer(
             mem_pool_device,
-            host_indices,
-            device_indices,
+            transfer_host_indices,
+            transfer_device_indices,
             io_backend=io_backend,
-            pool_transfers=pool_transfers,
+            pool_transfers=transfer_pool_transfers,
         )
         self._record_transfer_indices_on_current_stream(
-            host_indices, device_indices, pool_transfers
+            transfer_host_indices, transfer_device_indices, transfer_pool_transfers
         )
 
     def insert_req_host_indices(
