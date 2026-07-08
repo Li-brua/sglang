@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import time
+import weakref
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
@@ -345,7 +346,9 @@ def dsv4_dp_reduce_scatterv_split(
 def _get_dsv4_layer_from_context(layer_id: int) -> "DeepseekV4DecoderLayer":
     context = get_tc_piecewise_forward_context()
     moe_fusion = context.moe_fusions[layer_id]
-    return moe_fusion._dsv4_decoder_layer_for_pcg
+    layer = moe_fusion._dsv4_decoder_layer_for_pcg()
+    assert layer is not None
+    return layer
 
 
 def _dsv4_hc_pre_split_fake(
@@ -1318,7 +1321,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
-        self.mlp._dsv4_decoder_layer_for_pcg = self
+        self.mlp._dsv4_decoder_layer_for_pcg = weakref.ref(self)
 
     def refresh_mhc_norm_weight_cache(self):
         # Cache bf16 norm weights so the fused path does not allocate/cast per forward.
