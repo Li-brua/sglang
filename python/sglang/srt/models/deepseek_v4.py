@@ -110,6 +110,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -279,6 +280,66 @@ def deepseek_v4_attention_with_output(
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
     return
+
+
+def _use_dsv4_selective_prefill_pcg(forward_batch: "ForwardBatch") -> bool:
+    return (
+        envs.SGLANG_DSV4_SELECTIVE_PREFILL_PCG.get()
+        and is_in_tc_piecewise_cuda_graph()
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    )
+
+
+@register_custom_op(mutates_args=["global_tokens"])
+@register_split_op()
+def dsv4_dp_gather_replicate_split(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    dp_gather_replicate(global_tokens, local_tokens, forward_batch)
+
+
+@register_custom_op(mutates_args=["global_tokens"])
+@register_split_op()
+def dsv4_dp_gather_partial_split(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    dp_gather_partial(global_tokens, local_tokens, forward_batch)
+
+
+@register_custom_op(mutates_args=["local_tokens"])
+@register_split_op()
+def dsv4_dp_scatter_split(
+    local_tokens: torch.Tensor,
+    global_tokens: torch.Tensor,
+) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    dp_scatter(local_tokens, global_tokens, forward_batch)
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def dsv4_dp_reduce_scatter_tensor_split(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+) -> None:
+    dp_reduce_scatter_tensor(output, input_tensor)
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def dsv4_dp_reduce_scatterv_split(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+) -> None:
+    get_tp_group().reduce_scatterv(
+        input_tensor,
+        output=output,
+        sizes=get_dp_global_num_tokens(),
+    )
 
 
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
@@ -1041,11 +1102,19 @@ class MQALayer(nn.Module):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            use_selective_pcg = _use_dsv4_selective_prefill_pcg(forward_batch)
+            if forward_batch.forward_mode.is_extend() and (
+                is_in_breakable_cuda_graph() or use_selective_pcg
+            ):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
-                bcg_deepseek_v4_attention_with_output(
+                graph_attention_fn = (
+                    bcg_deepseek_v4_attention_with_output
+                    if is_in_breakable_cuda_graph()
+                    else deepseek_v4_attention_with_output
+                )
+                graph_attention_fn(
                     attn_q,
                     attn_k,
                     o,
@@ -1552,7 +1621,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            if _use_dsv4_selective_prefill_pcg(forward_batch):
+                dsv4_dp_gather_partial_split(hidden_states, local_hidden_states)
+            else:
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -1583,11 +1655,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (use_reduce_scatter above).
                 # This is the symmetric inverse of the all_gatherv gather.
-                get_tp_group().reduce_scatterv(
-                    global_hidden_states,
-                    output=hidden_states,
-                    sizes=get_dp_global_num_tokens(),
-                )
+                if _use_dsv4_selective_prefill_pcg(forward_batch):
+                    dsv4_dp_reduce_scatterv_split(hidden_states, global_hidden_states)
+                else:
+                    get_tp_group().reduce_scatterv(
+                        global_hidden_states,
+                        output=hidden_states,
+                        sizes=get_dp_global_num_tokens(),
+                    )
             elif _use_reduce_scatter:
                 # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
                 # expert outputs AND scatter each rank its own (MAX_LEN-padded)
@@ -1598,9 +1673,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # variable-length reduce_scatterv branch is gated by
                 # is_dp_gatherv_active(), which is False under MAX_LEN), which in
                 # turn uses the aiter custom kernel when it fits (else RCCL).
-                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+                if _use_dsv4_selective_prefill_pcg(forward_batch):
+                    dsv4_dp_reduce_scatter_tensor_split(
+                        hidden_states, global_hidden_states
+                    )
+                else:
+                    dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
             else:
-                dp_scatter(hidden_states, global_hidden_states, forward_batch)
+                if _use_dsv4_selective_prefill_pcg(forward_batch):
+                    dsv4_dp_scatter_split(hidden_states, global_hidden_states)
+                else:
+                    dp_scatter(hidden_states, global_hidden_states, forward_batch)
             # PoC: add the locally-computed shared-expert output to this rank's
             # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
             # above). Covers both prefill (gatherv) and decode (dp_scatter).
@@ -2065,7 +2148,10 @@ class DeepseekV4Model(nn.Module):
             )
             # Token ids are replicated within an attention-TP group. Use replicate
             # gather here to avoid summing duplicated ids when attention_tp_size > 1.
-            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+            if _use_dsv4_selective_prefill_pcg(forward_batch):
+                dsv4_dp_gather_replicate_split(input_ids_global, input_ids[:, None])
+            else:
+                dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids

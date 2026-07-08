@@ -3282,6 +3282,18 @@ class ServerArgs:
         """
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
+        if envs.SGLANG_DSV4_SELECTIVE_PREFILL_PCG.get():
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            if (
+                is_deepseek_v4(self.get_model_config().hf_config)
+                and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            ):
+                logger.warning(
+                    "SGLANG_DSV4_SELECTIVE_PREFILL_PCG=1 switches DeepSeek-V4 "
+                    "prefill CUDA graph backend from breakable to tc_piecewise."
+                )
+                self.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
         if self.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
@@ -3291,17 +3303,27 @@ class ServerArgs:
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+        from sglang.srt.configs.model_config import is_deepseek_v4
 
         """TcPiecewise (torch.compile + piecewise) is incompatible with
         these configurations. Most are torch.compile / dynamo limitations.
         """
+        dsv4_selective_prefill_pcg = (
+            envs.SGLANG_DSV4_SELECTIVE_PREFILL_PCG.get()
+            and is_deepseek_v4(self.get_model_config().hf_config)
+        )
 
         rules = [
             (
                 "model-arch blacklist",
-                lambda: self.get_model_config().is_piecewise_cuda_graph_disabled_model,
+                lambda: self.get_model_config().is_piecewise_cuda_graph_disabled_model
+                and not dsv4_selective_prefill_pcg,
             ),
-            ("DP attention", lambda: self._resolved().enable_dp_attention),
+            (
+                "DP attention",
+                lambda: self._resolved().enable_dp_attention
+                and not dsv4_selective_prefill_pcg,
+            ),
             ("full torch.compile mode", lambda: self.enable_torch_compile),
             ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),
             (
@@ -3332,7 +3354,11 @@ class ServerArgs:
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
             (
                 "CPU offload / hierarchical cache",
-                lambda: self.cpu_offload_gb > 0 or self.enable_hierarchical_cache,
+                lambda: self.cpu_offload_gb > 0
+                or (
+                    self.enable_hierarchical_cache
+                    and not dsv4_selective_prefill_pcg
+                ),
             ),
             (
                 "deterministic inference",

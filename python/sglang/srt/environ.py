@@ -826,6 +826,9 @@ class Envs:
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # Experimental: let DeepSeek-V4 prefill use selective tc_piecewise CUDA graph
+    # by carving attention / DP communication out as eager split ops. Default off.
+    SGLANG_DSV4_SELECTIVE_PREFILL_PCG = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
