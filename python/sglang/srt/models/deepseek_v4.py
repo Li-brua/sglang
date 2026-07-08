@@ -342,6 +342,62 @@ def dsv4_dp_reduce_scatterv_split(
     )
 
 
+def _get_dsv4_layer_from_context(layer_id: int) -> "DeepseekV4DecoderLayer":
+    context = get_tc_piecewise_forward_context()
+    moe_fusion = context.moe_fusions[layer_id]
+    return moe_fusion._dsv4_decoder_layer_for_pcg
+
+
+def _dsv4_hc_pre_split_fake(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    layer_id: int,
+    use_input_norm: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = x.shape[1]
+    y = torch.empty((x.shape[0], x.shape[-1]), dtype=x.dtype, device=x.device)
+    post = torch.empty((x.shape[0], hc_mult), dtype=torch.float32, device=x.device)
+    comb = torch.empty((x.shape[0], hc_mult, hc_mult), dtype=torch.float32, device=x.device)
+    return y, post, comb
+
+
+@register_custom_op(fake_impl=_dsv4_hc_pre_split_fake)
+@register_split_op()
+def dsv4_hc_pre_split(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    layer_id: int,
+    use_input_norm: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    layer = _get_dsv4_layer_from_context(layer_id)
+    norm = layer.input_layernorm if use_input_norm else layer.post_attention_layernorm
+    y, post, comb, _ = layer.hc_pre(
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        norm=norm,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+    )
+    return y, post, comb
+
+
+@register_custom_op(out_shape="residual")
+@register_split_op()
+def dsv4_hc_post_split(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    return _get_dsv4_layer_from_context(layer_id).hc_post(x, residual, post, comb)
+
+
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
@@ -1262,6 +1318,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
+        self.mlp._dsv4_decoder_layer_for_pcg = self
 
     def refresh_mhc_norm_weight_cache(self):
         # Cache bf16 norm weights so the fused path does not allocate/cast per forward.
@@ -1467,14 +1524,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant = None
         else:
             residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                norm=self.input_layernorm,
-                forward_batch=forward_batch,
-            )
+            if _use_dsv4_selective_prefill_pcg(forward_batch):
+                hidden_states, post, comb = dsv4_hc_pre_split(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.layer_id,
+                    True,
+                )
+                norm_fused = True
+            else:
+                hidden_states, post, comb, norm_fused = self.hc_pre(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm=self.input_layernorm,
+                    forward_batch=forward_batch,
+                )
             if not norm_fused:
                 if _use_aiter and _is_gfx95_supported:
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
@@ -1536,16 +1604,32 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
                 norm_fused = True
         else:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if _use_dsv4_selective_prefill_pcg(forward_batch):
+                hidden_states = dsv4_hc_post_split(
+                    hidden_states, residual, post, comb, self.layer_id
+                )
+            else:
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
             residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                norm=self.post_attention_layernorm,
-                forward_batch=forward_batch,
-            )
+            if _use_dsv4_selective_prefill_pcg(forward_batch):
+                hidden_states, post, comb = dsv4_hc_pre_split(
+                    hidden_states,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    self.layer_id,
+                    False,
+                )
+                norm_fused = True
+            else:
+                hidden_states, post, comb, norm_fused = self.hc_pre(
+                    hidden_states,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    norm=self.post_attention_layernorm,
+                    forward_batch=forward_batch,
+                )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1697,7 +1781,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = torch.cat(gathered)
 
         if not use_fused:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if _use_dsv4_selective_prefill_pcg(forward_batch):
+                hidden_states = dsv4_hc_post_split(
+                    hidden_states, residual, post, comb, self.layer_id
+                )
+            else:
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
