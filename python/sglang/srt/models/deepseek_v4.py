@@ -343,6 +343,18 @@ def dsv4_dp_reduce_scatterv_split(
     )
 
 
+@register_custom_op(mutates_args=["q_output"])
+@register_split_op()
+def dsv4_fused_q_norm_rope_split(
+    q_input: torch.Tensor,
+    q_output: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+) -> None:
+    fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions)
+
+
 def _get_dsv4_layer_from_context(layer_id: int) -> "DeepseekV4DecoderLayer":
     context = get_tc_piecewise_forward_context()
     moe_fusion = context.moe_fusions[layer_id]
@@ -637,7 +649,10 @@ class MQALayer(nn.Module):
         if q_out is None:
             q_out = torch.empty_like(q)
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
-        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        if is_in_tc_piecewise_cuda_graph() and envs.SGLANG_DSV4_SELECTIVE_PREFILL_PCG.get():
+            dsv4_fused_q_norm_rope_split(q, q_out, self.freqs_cis, positions, self.eps)
+        else:
+            fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
 
     def _compute_kv_to_cache(
