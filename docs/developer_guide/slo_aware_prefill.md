@@ -1,0 +1,540 @@
+# SLO-Aware Prefill Scheduling 设计文档
+
+本文档描述当前分支中新增的 **SLO-aware prefill scheduling** 特性。该特性受 SOLA 论文启发，目标是在 SGLang 的现有 scheduler 架构内，通过动态控制 prefill admission、chunk size、prefill 请求数量和阶段优先级，在 TTFT 与 TPOT 之间做显式 tradeoff。
+
+当前实现是 **SOLA-style incremental implementation**，不是完整 SOLA 论文实现。它优先解决单机 TP 场景下 prefill 与 decode 互相干扰的问题，并为后续补齐 cost model、peak memory prediction、request-level constrained optimization 预留结构。
+
+## 背景
+
+LLM serving 中每个请求主要包含两个阶段：
+
+- **Prefill**：处理 prompt，生成首 token。主要影响 TTFT。
+- **Decode**：逐 token 生成输出。主要影响 TPOT。
+
+SGLang 默认调度策略在高负载下可能出现两类偏置：
+
+- Prefill 过多：TTFT 较好，但 decode 被长 prefill chunk 阻塞，TPOT 恶化。
+- Decode 过多：TPOT 较好，但 prefill 请求长期排队，TTFT 恶化。
+
+SOLA 的核心思想是：每个 iteration 都根据当前系统状态决定调度目标和 workload，而不是固定 prefill-first 或 decode-first。当前实现将该思想落到 SGLang 的 prefill scheduling path 上。
+
+## 用户参数
+
+新增参数定义在 `python/sglang/srt/server_args.py`：
+
+```bash
+--enable-slo-aware-prefill
+--slo-prefill-ttft-slo-ms <float>
+--slo-prefill-tpot-slo-ms <float>
+--slo-prefill-tile-size <int>
+--slo-prefill-min-chunk-size <int>
+--disable-slo-prefill-priority-boost
+```
+
+常用启动示例：
+
+```bash
+sglang serve \
+  --model-path /path/to/model \
+  --tp 4 \
+  --enable-metrics \
+  --chunked-prefill-size 8192 \
+  --enable-slo-aware-prefill \
+  --slo-prefill-ttft-slo-ms 2000 \
+  --slo-prefill-tpot-slo-ms 50 \
+  --slo-prefill-min-chunk-size 512 \
+  --slo-prefill-tile-size 128
+```
+
+注意：
+
+- `--enable-slo-aware-prefill` 只开启控制器。
+- `--chunked-prefill-size` 仍然需要显式设置，否则不会自动启用 chunked prefill。
+- `--slo-prefill-ttft-slo-ms` 和 `--slo-prefill-tpot-slo-ms` 是必填目标值。
+- `--slo-prefill-min-chunk-size` 决定 TPOT 保护模式下的最小 prefill chunk。
+
+## 总体架构
+
+主要改动文件：
+
+- `python/sglang/srt/managers/slo_aware_prefill.py`
+  - 定义 `SloAwarePrefillController`。
+  - 根据 TTFT/TPOT pressure 生成 `SloAwarePrefillDecision`。
+- `python/sglang/srt/managers/scheduler.py`
+  - 在 scheduler 初始化时创建 controller。
+  - 在 `_get_new_batch_prefill_raw` 中调用 controller。
+  - 根据 controller 决策调整 `chunked_prefill_size`、`prefill_max_requests`、是否 yield 给 decode。
+- `python/sglang/srt/server_args.py`
+  - 增加 CLI 参数和参数校验。
+- `test/registered/unit/managers/test_slo_aware_prefill.py`
+  - 覆盖 TPOT 保护、TTFT 优先、高并发边界、TP rank 确定性等行为。
+
+调度链路如下：
+
+```text
+ServerArgs
+  -> Scheduler.init_schedule_policy()
+      -> SloAwarePrefillController(...)
+  -> Scheduler._get_new_batch_prefill_raw()
+      -> controller.make_decision(...)
+      -> possibly return None to run decode first
+      -> else adjust PrefillAdder inputs
+          - chunked_prefill_size
+          - prefill_max_requests
+          - waiting_queue order
+```
+
+## 核心状态
+
+### TTFT Pressure
+
+TTFT pressure 表示当前 prefill 请求距离 TTFT SLO 的压力。
+
+当前近似实现：
+
+```text
+ttft_pressure = max_prefill_wait_time / ttft_slo
+```
+
+其中 `max_prefill_wait_time` 来自：
+
+- waiting queue 中所有尚未 prefill 的请求；
+- 当前正在 chunked prefill 中的 `chunked_req`。
+
+如果：
+
+```text
+--slo-prefill-ttft-slo-ms 2000
+```
+
+且日志中：
+
+```text
+ttft_pressure=0.5
+```
+
+则表示当前最急 prefill 请求已经等待约 `1000ms`。
+
+### TPOT Pressure
+
+TPOT pressure 表示当前 decode 请求距离 TPOT SLO 的压力。
+
+当前近似实现综合两部分：
+
+```text
+decode_gap = now - last_decode_finish_time
+historical_avg_tpot = (last_decode_finish_time - prefill_finished_time) / decoded_tokens
+tpot_pressure = max(decode_gap, historical_avg_tpot) / tpot_slo
+```
+
+这样做的原因是：
+
+- 只看 historical average TPOT 会反应太慢；
+- 短输出请求只有几个 decode token，很可能请求结束前 controller 还没感知到 TPOT 变差；
+- `decode_gap` 能捕捉当前 decode 被 prefill 阻塞的实时风险。
+
+如果：
+
+```text
+--slo-prefill-tpot-slo-ms 50
+```
+
+且日志中：
+
+```text
+tpot_pressure=0.4
+```
+
+则表示当前最坏 decode gap 或平均 TPOT 约为 `20ms`。
+
+### EMA Pressure
+
+controller 还维护：
+
+```text
+ttft_ema
+tpot_ema
+```
+
+EMA 当前只用于日志观察，不再直接决定调度目标。
+
+早期实现曾使用 EMA + 上一次 objective 做 hysteresis，但 TP 多进程下不同 rank 的 `perf_counter()` 和 pressure 可能存在极小差异，导致不同 TP rank 在同一 iteration 选择不同 objective，进而造成 distributed forward hang。当前版本已经移除该粘滞逻辑，改为确定性目标选择。
+
+## Objective 选择
+
+当前 controller 有两个 objective：
+
+```text
+objective=ttft
+objective=tpot
+```
+
+含义：
+
+- `ttft`：优先 prefill，减少 waiting queue 中请求的 TTFT。
+- `tpot`：优先 decode，保护 running 请求的 TPOT。
+
+选择规则：
+
+```text
+if no active decode:
+    objective = ttft
+elif tpot_pressure >= 1 and ttft_pressure < 1:
+    objective = tpot
+elif ttft_pressure >= 1 and tpot_pressure < 1:
+    objective = ttft
+elif tpot_pressure > ttft_pressure + margin:
+    objective = tpot
+else:
+    objective = ttft
+```
+
+其中：
+
+```text
+margin = 0.10
+```
+
+并且 pressure 会 round 到两位小数后再比较，避免 TP ranks 因浮点微小差异产生不同决策。
+
+这种规则对应 SOLA 的高层思想：
+
+- TPOT 违反而 TTFT 有余量：优化 TPOT，约束 TTFT。
+- TTFT 违反而 TPOT 有余量：优化 TTFT，约束 TPOT。
+- 两者都未违反：优化更接近 SLO 边界的一侧。
+- 模糊区域默认回到 TTFT，避免 prefill 长期饥饿和 TP rank 分歧。
+
+## Workload 控制
+
+### Dynamic Chunk Size
+
+controller 根据 objective 和 pressure 动态缩放 `chunked_prefill_size`。
+
+简化规则：
+
+```text
+no active decode:
+    chunk = base_chunk or 0.75 * base_chunk
+
+objective=tpot:
+    if ttft_pressure < 1:
+        chunk = min_chunk
+    else:
+        chunk = 0.25 * base_chunk
+
+objective=ttft:
+    if tpot_pressure >= 1.5 and ttft_pressure < tpot_pressure:
+        chunk = 0.25 * base_chunk
+    elif tpot_pressure >= 1.0:
+        chunk = 0.5 * base_chunk
+    elif tpot_pressure >= 0.85:
+        chunk = 0.75 * base_chunk
+    elif ttft_pressure >= 1.0:
+        chunk = base_chunk
+    else:
+        chunk = 0.75 * base_chunk
+```
+
+最终 chunk 会被约束到：
+
+```text
+min_chunk_size <= chunk <= base_chunk <= max_prefill_tokens
+```
+
+并按 `lcm(page_size, tile_size)` 向下对齐。
+
+### Prefill Request Count
+
+在 `objective=tpot` 时，controller 会限制：
+
+```text
+prefill_max_requests = 1
+```
+
+在 `objective=ttft` 时，通常保留用户原始 `prefill_max_requests`，使高并发下 TTFT 能恢复。
+
+如果 TPOT pressure 非常高，并且 TTFT pressure 仍然低于 TPOT pressure，则即使在 `objective=ttft` 下也会临时限制 prefill 请求数。
+
+### Yield To Decode
+
+当满足：
+
+```text
+objective=tpot
+has_decode_work=True
+ttft_pressure < 1.0
+```
+
+controller 设置：
+
+```text
+yield_to_decode=True
+```
+
+scheduler 收到该决策后返回 `None`，从而让 `get_next_batch_to_run()` 走 decode path。
+
+这解决了一个关键问题：已有 `chunked_req` 不应该连续占据所有 iteration，否则 decode token 会被多个 prefill chunk 阻塞，导致 TPOT p99 上升。
+
+## `allow_prefill` 与 `yield_to_decode`
+
+日志中可能出现：
+
+```text
+allow=True, yield_to_decode=True
+```
+
+这不是矛盾。
+
+原因是：
+
+- 如果当前有 `chunked_req`，controller 会将 `allow_prefill=True`，避免把 chunked request 当成普通 prefill drop。
+- 但 scheduler 中 `yield_to_decode` 优先级更高。
+
+实际执行逻辑是：
+
+```text
+if yield_to_decode and chunked_req exists:
+    return None  # run decode first
+elif not allow_prefill:
+    return None
+else:
+    run prefill
+```
+
+因此 `allow=True, yield_to_decode=True` 的含义是：
+
+```text
+当前有 chunked prefill，但本 iteration 仍然让 decode 先跑。
+```
+
+## Waiting Queue 排序
+
+controller 支持 request-level priority boost。
+
+当 `objective=ttft`：
+
+- prefill 请求优先；
+- 按预测 TTFT 降序排序；
+- 预测值近似为：
+
+```text
+wait_time + remaining_input_tokens / max_prefill_tokens
+```
+
+当 `objective=tpot`：
+
+- waiting queue 中若存在 decode/retracted 请求，则 decode 优先；
+- decode 请求按当前 request-level TPOT pressure 排序。
+
+如果需要关闭该排序：
+
+```bash
+--disable-slo-prefill-priority-boost
+```
+
+## TP Rank 一致性
+
+TP=4 场景中，所有 TP ranks 必须在同一 iteration 做出一致的调度决策。
+
+曾经出现的问题：
+
+```text
+TP0 objective=tpot, yield_to_decode=True
+TP1 objective=tpot, yield_to_decode=True
+TP2 objective=tpot, yield_to_decode=True
+TP3 objective=ttft, yield_to_decode=False
+```
+
+这种分歧会让不同 rank 进入不同 forward path，一部分 rank 跑 decode，另一部分 rank 跑 prefill，容易在 collective 或 CUDA graph 中 hang，且后台不一定报错。
+
+当前修复：
+
+- objective 不再依赖上一轮状态；
+- pressure 比较前 round 到两位小数；
+- 模糊区确定性选择 `ttft`；
+- 新增单测覆盖 sticky `tpot` 切换问题。
+
+## 日志与调试
+
+启动建议：
+
+```bash
+PYTHONFAULTHANDLER=1 \
+SGLANG_LOG_MS=1 \
+SGLANG_LOG_FORWARD_ITERS=1 \
+SGLANG_RECORD_STEP_TIME=1 \
+SGLANG_LOG_SCHEDULER_STATUS_TARGET=stdout \
+SGLANG_LOG_SCHEDULER_STATUS_INTERVAL=5 \
+sglang serve \
+  ... \
+  --log-level debug \
+  --decode-log-interval 1 \
+  --enable-request-time-stats-logging
+```
+
+关键日志：
+
+```text
+SLO-aware prefill enabled: ...
+SLO prefill decision: objective=..., allow=..., yield_to_decode=..., chunk=..., ttft_pressure=..., tpot_pressure=...
+scheduler.status ...
+Prefill batch ...
+Decode batch ...
+```
+
+排查命令：
+
+```bash
+grep -E "SLO-aware prefill enabled|SLO prefill decision|scheduler.status|Prefill batch|Decode batch" /tmp/sglang-sola-debug.log | tail -n 300
+```
+
+如果压测停止但服务仍有 `/metrics`：
+
+```bash
+curl -s http://127.0.0.1:30000/v1/loads | jq
+curl -s http://127.0.0.1:30000/metrics | grep -E "num_running_reqs|num_queue_reqs|token_usage"
+```
+
+## 典型行为
+
+### 低并发 / 无 decode
+
+```text
+objective=ttft
+chunk=0.75 * base_chunk or base_chunk
+```
+
+目标是快速消化 prefill。
+
+### 中并发 / TPOT 接近 SLO
+
+```text
+objective=tpot
+yield_to_decode=True
+chunk=min_chunk
+prefill_max_requests=1
+```
+
+目标是让 decode 插队，降低 TPOT p90/p99。
+
+### 高并发 / TTFT 爆炸但 TPOT 正常
+
+```text
+objective=ttft
+chunk=base_chunk
+prefill_max_requests=None
+```
+
+目标是避免过度保护 TPOT 造成 prefill starvation。
+
+### 两者都超 SLO
+
+当前使用 pressure 大小做近似切换：
+
+- TPOT pressure 明显更大：`objective=tpot`。
+- 否则：`objective=ttft`。
+
+完整 SOLA 中应该进一步引入 percentile-level constraint relaxation。
+
+## 与 SOLA 论文的对应关系
+
+当前实现已经覆盖 SOLA 的部分设计点：
+
+| SOLA 机制 | 当前实现状态 |
+| --- | --- |
+| Fine-grained iteration-level scheduling | 通过 prefill admission/yield 控制实现 |
+| Phase-level prioritization | `objective=ttft/tpot` 控制 prefill/decode 优先级 |
+| Workload size control | 动态 `chunked_prefill_size` 与 `prefill_max_requests` |
+| Request-level prioritization | waiting queue urgency sort |
+| State monitor | TTFT/TPOT pressure + EMA 日志 |
+| Constraint conversion | 根据 TTFT/TPOT pressure 切换 objective |
+| Peak memory prediction | 尚未实现，依赖 SGLang 现有 allocator/admission |
+| Cost model `Cp/Cd` | 尚未实现，当前使用启发式 pressure/chunk 规则 |
+| Output length prediction | 尚未实现 |
+| Percentile-level relaxation | 尚未实现 |
+
+## 已知限制
+
+1. **不是完整 constrained optimization**
+   - 当前不是求解 Eq. 1 / Eq. 2，而是启发式近似。
+
+2. **缺少在线 cost model**
+   - 当前 `Cp` / `Cd` 没有根据真实 forward latency 动态拟合。
+   - chunk size 只按 pressure 缩放，不能精确预测一个 prefill chunk 对 TPOT 的影响。
+
+3. **缺少 output length prediction**
+   - request-level decode priority 没有完整估计 remaining output length。
+
+4. **缺少 peak memory prediction**
+   - 高并发下 memory 边界仍主要依赖 SGLang 原有 admission 和 allocator。
+
+5. **TP 多进程一致性依赖确定性规则**
+   - 当前用 deterministic objective 规则规避分歧。
+   - 更稳妥的长期方案是由 rank 0 统一生成调度决策并 broadcast。
+
+## 后续完整 SOLA 路线
+
+### Phase 1：可观测性完善
+
+- 暴露 Prometheus metrics：
+  - `sglang:slo_prefill_ttft_pressure`
+  - `sglang:slo_prefill_tpot_pressure`
+  - `sglang:slo_prefill_objective`
+  - `sglang:slo_prefill_chunk_size`
+  - `sglang:slo_prefill_yield_total`
+- 增加 objective transition 日志。
+
+### Phase 2：在线 Cost Model
+
+实现轻量在线模型：
+
+```text
+Cp ~= a0 * sum(l_has * l_in) + b0 * sum(l_in^2) + c0 * sum(l_in) + d0
+Cd ~= a1 * batch_size + b1 * sum(kv_len) + c1
+```
+
+输入来自每轮实际 forward batch：
+
+- prefill token 数；
+- prefix/KV 长度；
+- decode batch size；
+- forward latency。
+
+### Phase 3：Constrained Workload
+
+基于 cost model 近似 SOLA Eq. 1 / Eq. 2：
+
+- `objective=ttft`：计算最大可接受 prefill token budget `ki`，约束 TPOT。
+- `objective=tpot`：计算最小需要加入的 prefill 请求数 `ni`，约束 TTFT。
+
+### Phase 4：Peak Memory Prediction
+
+在加入 prefill 请求前预测未来 KV 峰值，避免高并发下触发 preemption 或 allocator 边界问题。
+
+### Phase 5：TP Rank Broadcast
+
+长期最稳方案：
+
+```text
+rank0 computes SloAwarePrefillDecision
+broadcast decision to all TP ranks
+all ranks use identical objective/chunk/yield decision
+```
+
+这样可以彻底消除因本地 clock、EMA、浮点差异导致的 rank divergence。
+
+## 当前验证
+
+当前实现配套单测：
+
+```bash
+python3 test/registered/unit/managers/test_slo_aware_prefill.py
+```
+
+覆盖场景：
+
+- TPOT pressure 下延迟 prefill；
+- TTFT pressure 高时恢复 prefill capacity；
+- chunked prefill yield 给 decode；
+- ambiguous low-pressure 场景默认 TTFT；
+- 避免 sticky `tpot` 导致 TP rank 分歧。
