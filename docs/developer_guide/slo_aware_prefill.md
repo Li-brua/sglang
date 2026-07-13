@@ -352,6 +352,7 @@ TP3 objective=ttft, yield_to_decode=False
 - objective 不再依赖上一轮状态；
 - pressure 比较前 round 到两位小数；
 - 模糊区确定性选择 `ttft`；
+- Scheduler 以 TP rank 0 的 `SloAwarePrefillDecision` 为准，通过 `tp_group.broadcast_object` 同步给同一 TP group 的其它 rank；
 - 新增单测覆盖 sticky `tpot` 切换问题。
 
 ## 日志与调试
@@ -468,9 +469,9 @@ prefill_max_requests=None
 4. **缺少 peak memory prediction**
    - 高并发下 memory 边界仍主要依赖 SGLang 原有 admission 和 allocator。
 
-5. **TP 多进程一致性依赖确定性规则**
-   - 当前用 deterministic objective 规则规避分歧。
-   - 更稳妥的长期方案是由 rank 0 统一生成调度决策并 broadcast。
+5. **TP 多进程一致性**
+   - 当前由 TP rank 0 统一生成 SLO-aware prefill 决策，并 broadcast 给同一 TP group 的其它 rank。
+   - deterministic objective 规则仍然保留，用于降低 rank0 决策自身的边界抖动。
 
 ## 后续完整 SOLA 路线
 
@@ -513,7 +514,7 @@ Cd ~= a1 * batch_size + b1 * sum(kv_len) + c1
 
 ### Phase 5：TP Rank Broadcast
 
-长期最稳方案：
+该项已经在当前实现中落地：
 
 ```text
 rank0 computes SloAwarePrefillDecision
@@ -521,7 +522,7 @@ broadcast decision to all TP ranks
 all ranks use identical objective/chunk/yield decision
 ```
 
-这样可以彻底消除因本地 clock、EMA、浮点差异导致的 rank divergence。
+后续可以继续优化 broadcast payload，或把 SLO decision 与其它 scheduler control-plane 状态合并同步。
 
 ## 当前验证
 

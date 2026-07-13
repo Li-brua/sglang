@@ -172,7 +172,10 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.slo_aware_prefill import SloAwarePrefillController
+from sglang.srt.managers.slo_aware_prefill import (
+    SloAwarePrefillController,
+    SloAwarePrefillDecision,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -2888,6 +2891,9 @@ class Scheduler(
                 default_chunked_prefill_size=chunked_prefill_size,
                 default_prefill_max_requests=prefill_max_requests,
             )
+            slo_prefill_decision = self._sync_slo_prefill_decision(
+                slo_prefill_decision
+            )
             self.slo_prefill_log_ct += 1
             should_log_slo_prefill = (
                 self.slo_prefill_log_ct % self.slo_prefill_log_interval == 0
@@ -3292,6 +3298,13 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    def _sync_slo_prefill_decision(self, decision: SloAwarePrefillDecision):
+        if self.tp_group.world_size == 1:
+            return decision
+        return self.tp_group.broadcast_object(
+            decision if self.tp_group.rank_in_group == 0 else None, src=0
+        )
 
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
