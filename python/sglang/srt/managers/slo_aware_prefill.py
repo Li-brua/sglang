@@ -76,7 +76,7 @@ class SloAwarePrefillController:
             ttft_pressure, tpot_pressure
         )
         objective = self._choose_objective(
-            smoothed_ttft_pressure, smoothed_tpot_pressure, has_decode_work
+            ttft_pressure, tpot_pressure, has_decode_work
         )
         optimize_ttft = objective == "ttft"
 
@@ -141,17 +141,21 @@ class SloAwarePrefillController:
     ) -> str:
         if not has_decode_work:
             return "ttft"
-        if ttft_pressure >= 1.0 and tpot_pressure >= 1.0:
-            return "ttft" if ttft_pressure >= tpot_pressure else "tpot"
-        if ttft_pressure >= 1.0:
-            return "ttft"
-        if tpot_pressure >= 1.0:
+
+        ttft_pressure = self._quantize_pressure(ttft_pressure)
+        tpot_pressure = self._quantize_pressure(tpot_pressure)
+        margin = self.objective_margin
+
+        if tpot_pressure >= 1.0 and ttft_pressure < 1.0:
             return "tpot"
-        if ttft_pressure > tpot_pressure + self.objective_margin:
+        if ttft_pressure >= 1.0 and tpot_pressure < 1.0:
             return "ttft"
-        if tpot_pressure > ttft_pressure + self.objective_margin:
+        if tpot_pressure > ttft_pressure + margin:
             return "tpot"
-        return self._last_objective
+        return "ttft"
+
+    def _quantize_pressure(self, pressure: float) -> float:
+        return round(pressure, 2)
 
     def _max_prefill_requests(
         self,

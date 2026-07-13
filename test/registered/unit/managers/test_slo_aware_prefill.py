@@ -163,6 +163,46 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertIsNone(decision.max_prefill_requests)
         self.assertFalse(decision.yield_prefill_to_decode)
 
+    def test_ambiguous_low_pressure_defaults_to_ttft_without_sticky_tpot(self):
+        controller = self.create_controller()
+        high_tpot_running = SimpleNamespace(
+            reqs=[
+                FakeReq(
+                    prefill_finished_s=1.0,
+                    last_decode_finish_s=0.0,
+                    output_len=5,
+                )
+            ]
+        )
+        controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.1)],
+            running_batch=high_tpot_running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        balanced_running = SimpleNamespace(
+            reqs=[
+                FakeReq(
+                    prefill_finished_s=0.018,
+                    last_decode_finish_s=0.0,
+                    output_len=5,
+                )
+            ]
+        )
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.286)],
+            running_batch=balanced_running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "ttft")
+        self.assertTrue(decision.allow_prefill)
+        self.assertFalse(decision.yield_prefill_to_decode)
+
     def test_high_tpot_low_ttft_can_delay_prefill(self):
         controller = self.create_controller()
         running = SimpleNamespace(
