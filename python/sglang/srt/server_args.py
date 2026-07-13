@@ -718,6 +718,30 @@ class ServerArgs:
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    enable_slo_aware_prefill: A[
+        bool,
+        "Enable an experimental SLO-aware controller that dynamically adjusts chunked prefill admission based on TTFT/TPOT pressure.",
+    ] = False
+    slo_prefill_ttft_slo_ms: A[
+        Optional[float],
+        "TTFT SLO in milliseconds for --enable-slo-aware-prefill.",
+    ] = None
+    slo_prefill_tpot_slo_ms: A[
+        Optional[float],
+        "TPOT SLO in milliseconds for --enable-slo-aware-prefill.",
+    ] = None
+    slo_prefill_tile_size: A[
+        int,
+        "Tile multiple used when rounding SLO-aware dynamic prefill chunk sizes.",
+    ] = 128
+    slo_prefill_min_chunk_size: A[
+        Optional[int],
+        "Minimum dynamic chunk size for --enable-slo-aware-prefill. Defaults to --slo-prefill-tile-size.",
+    ] = None
+    disable_slo_prefill_priority_boost: A[
+        bool,
+        "Disable request urgency sorting in the SLO-aware prefill controller.",
+    ] = False
     schedule_policy: A[
         str,
         Arg(
@@ -6443,6 +6467,29 @@ class ServerArgs:
 
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.overrides import resolved_view
+
+        if self.enable_slo_aware_prefill:
+            if self.slo_prefill_ttft_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-ttft-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            if self.slo_prefill_tpot_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-tpot-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            if self.slo_prefill_ttft_slo_ms <= 0:
+                raise ValueError("--slo-prefill-ttft-slo-ms must be positive.")
+            if self.slo_prefill_tpot_slo_ms <= 0:
+                raise ValueError("--slo-prefill-tpot-slo-ms must be positive.")
+            if self.slo_prefill_tile_size <= 0:
+                raise ValueError("--slo-prefill-tile-size must be positive.")
+            if (
+                self.slo_prefill_min_chunk_size is not None
+                and self.slo_prefill_min_chunk_size <= 0
+            ):
+                raise ValueError("--slo-prefill-min-chunk-size must be positive.")
 
         # Handle optimistic prefill validation
         if (

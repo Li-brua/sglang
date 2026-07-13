@@ -172,6 +172,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.slo_aware_prefill import SloAwarePrefillController
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -1034,7 +1035,31 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
+        self.slo_prefill_controller: Optional[SloAwarePrefillController] = None
         self.max_prefill_bs: int = 0
+        if self.server_args.enable_slo_aware_prefill:
+            if self.server_args.slo_prefill_ttft_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-ttft-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            if self.server_args.slo_prefill_tpot_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-tpot-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            self.slo_prefill_controller = SloAwarePrefillController(
+                ttft_slo_ms=self.server_args.slo_prefill_ttft_slo_ms,
+                tpot_slo_ms=self.server_args.slo_prefill_tpot_slo_ms,
+                base_chunked_prefill_size=self.chunked_prefill_size,
+                max_prefill_tokens=self.max_prefill_tokens,
+                page_size=self.page_size,
+                tile_size=self.server_args.slo_prefill_tile_size,
+                min_chunk_size=self.server_args.slo_prefill_min_chunk_size,
+                prefill_priority_boost=(
+                    not self.server_args.disable_slo_prefill_priority_boost
+                ),
+            )
         if self.server_args.enable_prefill_delayer:
             if self.server_args.disaggregation_mode == "decode":
                 logger.info(
@@ -2844,6 +2869,21 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        prefill_max_requests = self.server_args.prefill_max_requests
+        if self.slo_prefill_controller is not None:
+            slo_prefill_decision = self.slo_prefill_controller.make_decision(
+                waiting_queue=self.waiting_queue,
+                running_batch=self.running_batch,
+                chunked_req=self.chunked_req,
+                default_chunked_prefill_size=chunked_prefill_size,
+                default_prefill_max_requests=prefill_max_requests,
+            )
+            if not slo_prefill_decision.allow_prefill:
+                return None
+            chunked_prefill_size = slo_prefill_decision.chunked_prefill_size
+            prefill_max_requests = slo_prefill_decision.max_prefill_requests
+            self.slo_prefill_controller.prioritize_waiting_queue(self.waiting_queue)
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2857,7 +2897,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
