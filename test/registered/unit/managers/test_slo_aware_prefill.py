@@ -59,7 +59,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
             prefill_priority_boost=True,
         )
 
-    def test_tpot_pressure_shrinks_and_limits_prefill(self):
+    def test_decode_pressure_delays_prefill_before_ttft_slo(self):
         controller = self.create_controller()
         running = SimpleNamespace(
             reqs=[
@@ -79,9 +79,61 @@ class TestSloAwarePrefillController(unittest.TestCase):
             default_prefill_max_requests=None,
         )
 
-        self.assertTrue(decision.allow_prefill)
-        self.assertEqual(decision.chunked_prefill_size, 512)
+        self.assertFalse(decision.allow_prefill)
+        self.assertEqual(decision.chunked_prefill_size, 128)
         self.assertEqual(decision.max_prefill_requests, 1)
+        self.assertTrue(decision.has_decode_work)
+        self.assertTrue(decision.yield_prefill_to_decode)
+
+    def test_decode_work_yields_even_before_tpot_violation(self):
+        controller = self.create_controller()
+        running = SimpleNamespace(
+            reqs=[
+                FakeReq(
+                    prefill_finished_s=0.01,
+                    last_decode_finish_s=0.0,
+                    output_len=2,
+                )
+            ]
+        )
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.1)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertLess(decision.tpot_pressure, 1.0)
+        self.assertFalse(decision.allow_prefill)
+        self.assertTrue(decision.yield_prefill_to_decode)
+
+    def test_decode_pressure_allows_limited_prefill_after_ttft_slo(self):
+        controller = self.create_controller()
+        running = SimpleNamespace(
+            reqs=[
+                FakeReq(
+                    prefill_finished_s=1.0,
+                    last_decode_finish_s=0.0,
+                    output_len=5,
+                )
+            ]
+        )
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=1.2)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertTrue(decision.allow_prefill)
+        self.assertEqual(decision.chunked_prefill_size, 256)
+        self.assertEqual(decision.max_prefill_requests, 1)
+        self.assertTrue(decision.has_decode_work)
+        self.assertFalse(decision.yield_prefill_to_decode)
 
     def test_high_tpot_low_ttft_can_delay_prefill(self):
         controller = self.create_controller()
@@ -126,6 +178,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertTrue(decision.allow_prefill)
+        self.assertTrue(decision.yield_prefill_to_decode)
 
     def test_prefill_urgency_sort(self):
         controller = self.create_controller()

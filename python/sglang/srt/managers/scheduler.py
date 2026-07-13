@@ -1036,6 +1036,8 @@ class Scheduler(
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.slo_prefill_controller: Optional[SloAwarePrefillController] = None
+        self.slo_prefill_log_interval = max(self.server_args.decode_log_interval, 1)
+        self.slo_prefill_log_ct = 0
         self.max_prefill_bs: int = 0
         if self.server_args.enable_slo_aware_prefill:
             if self.server_args.slo_prefill_ttft_slo_ms is None:
@@ -1059,6 +1061,14 @@ class Scheduler(
                 prefill_priority_boost=(
                     not self.server_args.disable_slo_prefill_priority_boost
                 ),
+            )
+            logger.info(
+                "SLO-aware prefill enabled: "
+                f"ttft_slo_ms={self.server_args.slo_prefill_ttft_slo_ms}, "
+                f"tpot_slo_ms={self.server_args.slo_prefill_tpot_slo_ms}, "
+                f"base_chunked_prefill_size={self.chunked_prefill_size}, "
+                f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
+                f"tile_size={self.server_args.slo_prefill_tile_size}"
             )
         if self.server_args.enable_prefill_delayer:
             if self.server_args.disaggregation_mode == "decode":
@@ -2878,6 +2888,28 @@ class Scheduler(
                 default_chunked_prefill_size=chunked_prefill_size,
                 default_prefill_max_requests=prefill_max_requests,
             )
+            self.slo_prefill_log_ct += 1
+            should_log_slo_prefill = (
+                self.slo_prefill_log_ct % self.slo_prefill_log_interval == 0
+            )
+            if should_log_slo_prefill:
+                logger.info(
+                    "SLO prefill decision: "
+                    f"allow={slo_prefill_decision.allow_prefill}, "
+                    f"yield_to_decode={slo_prefill_decision.yield_prefill_to_decode}, "
+                    f"has_decode={slo_prefill_decision.has_decode_work}, "
+                    f"chunk={slo_prefill_decision.chunked_prefill_size}, "
+                    f"prefill_max_requests={slo_prefill_decision.max_prefill_requests}, "
+                    f"ttft_pressure={slo_prefill_decision.ttft_pressure:.3f}, "
+                    f"tpot_pressure={slo_prefill_decision.tpot_pressure:.3f}, "
+                    f"waiting={len(self.waiting_queue)}, "
+                    f"running={len(self.running_batch.reqs)}"
+                )
+            if (
+                slo_prefill_decision.yield_prefill_to_decode
+                and self.chunked_req is not None
+            ):
+                return None
             if not slo_prefill_decision.allow_prefill:
                 return None
             chunked_prefill_size = slo_prefill_decision.chunked_prefill_size

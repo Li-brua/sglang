@@ -17,6 +17,8 @@ class SloAwarePrefillDecision:
     optimize_ttft: bool
     ttft_pressure: float
     tpot_pressure: float
+    has_decode_work: bool
+    yield_prefill_to_decode: bool
 
 
 class SloAwarePrefillController:
@@ -60,6 +62,7 @@ class SloAwarePrefillController:
     ) -> SloAwarePrefillDecision:
         now = time.perf_counter()
         ttft_pressure = self._ttft_pressure(now, waiting_queue, chunked_req)
+        has_decode_work = self._has_decode_work(running_batch.reqs)
         tpot_pressure = self._tpot_pressure(now, running_batch.reqs)
         optimize_ttft = ttft_pressure >= tpot_pressure
 
@@ -68,14 +71,23 @@ class SloAwarePrefillController:
         if base_chunk is not None:
             base_chunk = max(1, min(base_chunk, self.max_prefill_tokens))
             chunked_prefill_size = self._scale_chunk(
-                base_chunk, ttft_pressure, tpot_pressure
+                base_chunk, ttft_pressure, tpot_pressure, has_decode_work
             )
         allow_prefill = True
         max_prefill_requests = default_prefill_max_requests
 
+        if has_decode_work:
+            if max_prefill_requests is None:
+                max_prefill_requests = 1
+            else:
+                max_prefill_requests = min(max_prefill_requests, 1)
+
+        yield_prefill_to_decode = False
+        if has_decode_work and ttft_pressure < 1.0:
+            allow_prefill = False
+            yield_prefill_to_decode = True
+
         if tpot_pressure >= 1.0 and ttft_pressure < tpot_pressure:
-            if ttft_pressure < 0.5:
-                allow_prefill = False
             max_prefill_requests = 1
 
         if chunked_req is not None:
@@ -88,6 +100,8 @@ class SloAwarePrefillController:
             optimize_ttft=optimize_ttft,
             ttft_pressure=ttft_pressure,
             tpot_pressure=tpot_pressure,
+            has_decode_work=has_decode_work,
+            yield_prefill_to_decode=yield_prefill_to_decode,
         )
 
     def prioritize_waiting_queue(self, waiting_queue: list["Req"]) -> None:
@@ -97,9 +111,19 @@ class SloAwarePrefillController:
         waiting_queue.sort(key=lambda req: self._prefill_sort_key(now, req))
 
     def _scale_chunk(
-        self, base_chunk: int, ttft_pressure: float, tpot_pressure: float
+        self,
+        base_chunk: int,
+        ttft_pressure: float,
+        tpot_pressure: float,
+        has_decode_work: bool,
     ) -> int:
-        if tpot_pressure >= 1.0 and ttft_pressure < tpot_pressure:
+        if has_decode_work and ttft_pressure < 1.0:
+            scale = 0.0
+        elif has_decode_work and tpot_pressure >= 1.0:
+            scale = 0.25
+        elif has_decode_work:
+            scale = 0.25 if ttft_pressure < 1.5 else 0.5
+        elif tpot_pressure >= 1.0 and ttft_pressure < tpot_pressure:
             scale = 0.25 if ttft_pressure < 0.5 else 0.5
         elif tpot_pressure >= 0.85 and ttft_pressure < tpot_pressure:
             scale = 0.5
@@ -121,6 +145,14 @@ class SloAwarePrefillController:
             return max(self.page_size, min(value, self.max_prefill_tokens))
         return max(unit, value // unit * unit)
 
+    def _has_decode_work(self, running_reqs: Iterable["Req"]) -> bool:
+        return any(
+            not req.finished()
+            and not req.is_retracted
+            and len(req.output_ids) > 0
+            for req in running_reqs
+        )
+
     def _ttft_pressure(
         self, now: float, waiting_queue: Sequence["Req"], chunked_req: Optional["Req"]
     ) -> float:
@@ -138,14 +170,17 @@ class SloAwarePrefillController:
             return 0.0
         max_tpot = 0.0
         for req in running_reqs:
-            if req.finished() or req.is_retracted or len(req.output_ids) <= 1:
+            if req.finished() or req.is_retracted or len(req.output_ids) == 0:
                 continue
             start = req.time_stats.prefill_finished_time
             last = req.time_stats.last_decode_finish_time or now
-            if start <= 0.0 or last <= start:
-                continue
-            decode_tokens = max(len(req.output_ids) - 1, 1)
-            max_tpot = max(max_tpot, (last - start) / decode_tokens)
+            if start > 0.0:
+                decode_anchor = req.time_stats.last_decode_finish_time or start
+                if now > decode_anchor:
+                    max_tpot = max(max_tpot, now - decode_anchor)
+                if last > start and len(req.output_ids) > 1:
+                    decode_tokens = max(len(req.output_ids) - 1, 1)
+                    max_tpot = max(max_tpot, (last - start) / decode_tokens)
         return max_tpot / self.tpot_slo_s
 
     def _prefill_candidates(
