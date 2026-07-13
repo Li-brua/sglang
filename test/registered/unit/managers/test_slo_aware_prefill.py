@@ -85,7 +85,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertTrue(decision.has_decode_work)
         self.assertTrue(decision.yield_prefill_to_decode)
 
-    def test_decode_work_yields_even_before_tpot_violation(self):
+    def test_balanced_slack_allows_prefill(self):
         controller = self.create_controller()
         running = SimpleNamespace(
             reqs=[
@@ -106,8 +106,9 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertLess(decision.tpot_pressure, 1.0)
-        self.assertFalse(decision.allow_prefill)
-        self.assertTrue(decision.yield_prefill_to_decode)
+        self.assertTrue(decision.allow_prefill)
+        self.assertFalse(decision.yield_prefill_to_decode)
+        self.assertEqual(decision.objective, "ttft")
 
     def test_decode_pressure_allows_limited_prefill_after_ttft_slo(self):
         controller = self.create_controller()
@@ -133,6 +134,33 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertEqual(decision.chunked_prefill_size, 256)
         self.assertEqual(decision.max_prefill_requests, 1)
         self.assertTrue(decision.has_decode_work)
+        self.assertFalse(decision.yield_prefill_to_decode)
+        self.assertEqual(decision.objective, "tpot")
+
+    def test_high_ttft_low_tpot_uses_full_prefill_capacity(self):
+        controller = self.create_controller()
+        running = SimpleNamespace(
+            reqs=[
+                FakeReq(
+                    prefill_finished_s=0.01,
+                    last_decode_finish_s=0.0,
+                    output_len=5,
+                )
+            ]
+        )
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=2.0)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertTrue(decision.allow_prefill)
+        self.assertEqual(decision.objective, "ttft")
+        self.assertEqual(decision.chunked_prefill_size, 1024)
+        self.assertIsNone(decision.max_prefill_requests)
         self.assertFalse(decision.yield_prefill_to_decode)
 
     def test_high_tpot_low_ttft_can_delay_prefill(self):

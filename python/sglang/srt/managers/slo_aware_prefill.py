@@ -15,8 +15,11 @@ class SloAwarePrefillDecision:
     max_prefill_requests: Optional[int]
     allow_prefill: bool
     optimize_ttft: bool
+    objective: str
     ttft_pressure: float
     tpot_pressure: float
+    smoothed_ttft_pressure: float
+    smoothed_tpot_pressure: float
     has_decode_work: bool
     yield_prefill_to_decode: bool
 
@@ -24,9 +27,8 @@ class SloAwarePrefillDecision:
 class SloAwarePrefillController:
     """A lightweight SOLA-inspired controller for prefill admission.
 
-    This first version controls the amount of prefill work admitted in each
-    scheduler iteration. It keeps decode untouched and only changes the local
-    `PrefillAdder` inputs when explicitly enabled.
+    This controller approximates SOLA's state-aware scheduling in SGLang's
+    existing scheduler by changing prefill phase priority and workload size.
     """
 
     def __init__(
@@ -50,6 +52,12 @@ class SloAwarePrefillController:
         self.min_chunk_size = min_chunk_size or self.tile_size
         self.min_chunk_size = max(self.min_chunk_size, page_size, 1)
         self.prefill_priority_boost = prefill_priority_boost
+        self.pressure_alpha = 0.25
+        self.objective_margin = 0.10
+        self._has_pressure_sample = False
+        self._ttft_pressure_ema = 0.0
+        self._tpot_pressure_ema = 0.0
+        self._last_objective = "ttft"
 
     def make_decision(
         self,
@@ -64,42 +72,49 @@ class SloAwarePrefillController:
         ttft_pressure = self._ttft_pressure(now, waiting_queue, chunked_req)
         has_decode_work = self._has_decode_work(running_batch.reqs)
         tpot_pressure = self._tpot_pressure(now, running_batch.reqs)
-        optimize_ttft = ttft_pressure >= tpot_pressure
+        smoothed_ttft_pressure, smoothed_tpot_pressure = self._update_pressure(
+            ttft_pressure, tpot_pressure
+        )
+        objective = self._choose_objective(
+            smoothed_ttft_pressure, smoothed_tpot_pressure, has_decode_work
+        )
+        optimize_ttft = objective == "ttft"
 
         chunked_prefill_size = None
         base_chunk = default_chunked_prefill_size or self.base_chunked_prefill_size
         if base_chunk is not None:
             base_chunk = max(1, min(base_chunk, self.max_prefill_tokens))
             chunked_prefill_size = self._scale_chunk(
-                base_chunk, ttft_pressure, tpot_pressure, has_decode_work
+                base_chunk, ttft_pressure, tpot_pressure, objective, has_decode_work
             )
+
         allow_prefill = True
-        max_prefill_requests = default_prefill_max_requests
-
-        if has_decode_work:
-            if max_prefill_requests is None:
-                max_prefill_requests = 1
-            else:
-                max_prefill_requests = min(max_prefill_requests, 1)
-
         yield_prefill_to_decode = False
-        if has_decode_work and ttft_pressure < 1.0:
-            allow_prefill = False
-            yield_prefill_to_decode = True
+        max_prefill_requests = self._max_prefill_requests(
+            default_prefill_max_requests, objective, ttft_pressure, tpot_pressure
+        )
 
-        if tpot_pressure >= 1.0 and ttft_pressure < tpot_pressure:
-            max_prefill_requests = 1
+        if objective == "tpot" and has_decode_work:
+            if ttft_pressure < 1.0:
+                allow_prefill = False
+                yield_prefill_to_decode = True
+            else:
+                max_prefill_requests = 1
 
         if chunked_req is not None:
             allow_prefill = True
 
+        self._last_objective = objective
         return SloAwarePrefillDecision(
             chunked_prefill_size=chunked_prefill_size,
             max_prefill_requests=max_prefill_requests,
             allow_prefill=allow_prefill,
             optimize_ttft=optimize_ttft,
+            objective=objective,
             ttft_pressure=ttft_pressure,
             tpot_pressure=tpot_pressure,
+            smoothed_ttft_pressure=smoothed_ttft_pressure,
+            smoothed_tpot_pressure=smoothed_tpot_pressure,
             has_decode_work=has_decode_work,
             yield_prefill_to_decode=yield_prefill_to_decode,
         )
@@ -108,31 +123,73 @@ class SloAwarePrefillController:
         if not self.prefill_priority_boost or len(waiting_queue) <= 1:
             return
         now = time.perf_counter()
-        waiting_queue.sort(key=lambda req: self._prefill_sort_key(now, req))
+        waiting_queue.sort(key=lambda req: self._request_sort_key(now, req))
+
+    def _update_pressure(self, ttft_pressure: float, tpot_pressure: float) -> tuple[float, float]:
+        if not self._has_pressure_sample:
+            self._ttft_pressure_ema = ttft_pressure
+            self._tpot_pressure_ema = tpot_pressure
+            self._has_pressure_sample = True
+        else:
+            beta = 1.0 - self.pressure_alpha
+            self._ttft_pressure_ema = beta * self._ttft_pressure_ema + self.pressure_alpha * ttft_pressure
+            self._tpot_pressure_ema = beta * self._tpot_pressure_ema + self.pressure_alpha * tpot_pressure
+        return self._ttft_pressure_ema, self._tpot_pressure_ema
+
+    def _choose_objective(
+        self, ttft_pressure: float, tpot_pressure: float, has_decode_work: bool
+    ) -> str:
+        if not has_decode_work:
+            return "ttft"
+        if ttft_pressure >= 1.0 and tpot_pressure >= 1.0:
+            return "ttft" if ttft_pressure >= tpot_pressure else "tpot"
+        if ttft_pressure >= 1.0:
+            return "ttft"
+        if tpot_pressure >= 1.0:
+            return "tpot"
+        if ttft_pressure > tpot_pressure + self.objective_margin:
+            return "ttft"
+        if tpot_pressure > ttft_pressure + self.objective_margin:
+            return "tpot"
+        return self._last_objective
+
+    def _max_prefill_requests(
+        self,
+        default_prefill_max_requests: Optional[int],
+        objective: str,
+        ttft_pressure: float,
+        tpot_pressure: float,
+    ) -> Optional[int]:
+        if objective == "ttft":
+            if tpot_pressure >= 1.5 and ttft_pressure < tpot_pressure:
+                return 1
+            return default_prefill_max_requests
+        if default_prefill_max_requests is None:
+            return 1
+        return min(default_prefill_max_requests, 1)
 
     def _scale_chunk(
         self,
         base_chunk: int,
         ttft_pressure: float,
         tpot_pressure: float,
+        objective: str,
         has_decode_work: bool,
     ) -> int:
-        if has_decode_work and ttft_pressure < 1.0:
-            scale = 0.0
-        elif has_decode_work and tpot_pressure >= 1.0:
+        if not has_decode_work:
+            scale = 1.0 if ttft_pressure >= 1.0 else 0.75
+        elif objective == "tpot":
+            scale = 0.0 if ttft_pressure < 1.0 else 0.25
+        elif tpot_pressure >= 1.5 and ttft_pressure < tpot_pressure:
             scale = 0.25
-        elif has_decode_work:
-            scale = 0.25 if ttft_pressure < 1.5 else 0.5
-        elif tpot_pressure >= 1.0 and ttft_pressure < tpot_pressure:
-            scale = 0.25 if ttft_pressure < 0.5 else 0.5
-        elif tpot_pressure >= 0.85 and ttft_pressure < tpot_pressure:
+        elif tpot_pressure >= 1.0:
             scale = 0.5
-        elif ttft_pressure >= 1.0 and ttft_pressure >= tpot_pressure:
-            scale = 1.0
-        elif ttft_pressure > tpot_pressure:
+        elif tpot_pressure >= 0.85:
             scale = 0.75
+        elif ttft_pressure >= 1.0:
+            scale = 1.0
         else:
-            scale = 0.5
+            scale = 0.75
 
         chunk = int(base_chunk * scale)
         chunk = max(self.min_chunk_size, chunk)
@@ -192,10 +249,22 @@ class SloAwarePrefillController:
             if len(req.output_ids) == 0:
                 yield req
 
-    def _prefill_sort_key(self, now: float, req: "Req") -> tuple[int, float, float]:
+    def _request_sort_key(self, now: float, req: "Req") -> tuple[int, float, float]:
         is_prefill = len(req.output_ids) == 0
         entry = req.time_stats.wait_queue_entry_time or req.time_stats.scheduler_recv_time
         wait = now - entry if entry > 0.0 else 0.0
+        if self._last_objective == "tpot":
+            if not is_prefill:
+                tpot = self._request_tpot_pressure(now, req)
+                return (0, -tpot, entry)
+            return (1, -wait, entry)
         remaining_input = max(req.seqlen - req.num_matched_prefix_tokens, 0)
         predicted_ttft = wait + remaining_input / max(self.max_prefill_tokens, 1)
         return (0 if is_prefill else 1, -predicted_ttft, entry)
+
+    def _request_tpot_pressure(self, now: float, req: "Req") -> float:
+        start = req.time_stats.prefill_finished_time
+        if start <= 0.0 or self.tpot_slo_s <= 0.0:
+            return 0.0
+        anchor = req.time_stats.last_decode_finish_time or start
+        return max(now - anchor, 0.0) / self.tpot_slo_s

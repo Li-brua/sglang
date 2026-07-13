@@ -2895,6 +2895,7 @@ class Scheduler(
             if should_log_slo_prefill:
                 logger.info(
                     "SLO prefill decision: "
+                    f"objective={slo_prefill_decision.objective}, "
                     f"allow={slo_prefill_decision.allow_prefill}, "
                     f"yield_to_decode={slo_prefill_decision.yield_prefill_to_decode}, "
                     f"has_decode={slo_prefill_decision.has_decode_work}, "
@@ -2902,6 +2903,8 @@ class Scheduler(
                     f"prefill_max_requests={slo_prefill_decision.max_prefill_requests}, "
                     f"ttft_pressure={slo_prefill_decision.ttft_pressure:.3f}, "
                     f"tpot_pressure={slo_prefill_decision.tpot_pressure:.3f}, "
+                    f"ttft_ema={slo_prefill_decision.smoothed_ttft_pressure:.3f}, "
+                    f"tpot_ema={slo_prefill_decision.smoothed_tpot_pressure:.3f}, "
                     f"waiting={len(self.waiting_queue)}, "
                     f"running={len(self.running_batch.reqs)}"
                 )
