@@ -60,6 +60,7 @@ sglang serve \
 - `python/sglang/srt/managers/slo_aware_prefill.py`
   - 定义 `SloAwarePrefillController`。
   - 根据 TTFT/TPOT pressure 生成 `SloAwarePrefillDecision`。
+  - 暴露 `SloAwarePrefillPressureState`，支持 scheduler 先同步 pressure 再做决策。
 - `python/sglang/srt/managers/scheduler.py`
   - 在 scheduler 初始化时创建 controller。
   - 在 `_get_new_batch_prefill_raw` 中调用 controller。
@@ -76,7 +77,9 @@ ServerArgs
   -> Scheduler.init_schedule_policy()
       -> SloAwarePrefillController(...)
   -> Scheduler._get_new_batch_prefill_raw()
-      -> controller.make_decision(...)
+      -> controller.compute_pressure_state(...)
+      -> TP group all_reduce(MAX) syncs pressure state
+      -> controller.make_decision_from_pressure_state(...)
       -> possibly return None to run decode first
       -> else adjust PrefillAdder inputs
           - chunked_prefill_size
@@ -347,13 +350,27 @@ TP3 objective=ttft, yield_to_decode=False
 
 这种分歧会让不同 rank 进入不同 forward path，一部分 rank 跑 decode，另一部分 rank 跑 prefill，容易在 collective 或 CUDA graph 中 hang，且后台不一定报错。
 
-当前修复：
+当前修复不是给 TPOT 增加固定切换阈值，也不是广播完整 Python decision object，而是同步 objective 的输入状态：
 
-- objective 不再依赖上一轮状态；
+```text
+local PressureState = (ttft_pressure, tpot_pressure, has_decode_work)
+global PressureState = TP all_reduce(MAX, local PressureState)
+all ranks compute SloAwarePrefillDecision from global PressureState
+```
+
+这样做有几个好处：
+
+- 保留自适应：即使 TPOT 尚未达到 SLO，只要它相对 TTFT 更紧，仍然可以切到 `objective=tpot`。
+- 避免 rank 分歧：objective、chunk、yield、prefill request cap 都来自同一组 global pressure。
+- 避免 Python object broadcast：同步的是 3 个 float/bool 标量，当前使用 CPU tensor `all_reduce(MAX)`，不触碰 GPU stream。
+- 采用保守聚合：任一 TP rank 看到更高 TTFT/TPOT pressure，全组都按更高压力处理。
+
+同时仍保留：
+
+- objective 不依赖上一轮状态；
 - pressure 比较前 round 到两位小数；
 - 模糊区确定性选择 `ttft`；
-- Scheduler 以 TP rank 0 的 `SloAwarePrefillDecision` 为准，通过 `tp_group.broadcast_object` 同步给同一 TP group 的其它 rank；
-- 新增单测覆盖 sticky `tpot` 切换问题。
+- 单测覆盖 sticky `tpot` 和 pre-SLO TPOT 自适应切换问题。
 
 ## 日志与调试
 
@@ -470,8 +487,8 @@ prefill_max_requests=None
    - 高并发下 memory 边界仍主要依赖 SGLang 原有 admission 和 allocator。
 
 5. **TP 多进程一致性**
-   - 当前由 TP rank 0 统一生成 SLO-aware prefill 决策，并 broadcast 给同一 TP group 的其它 rank。
-   - deterministic objective 规则仍然保留，用于降低 rank0 决策自身的边界抖动。
+   - 当前同步的是 TP group 内的 pressure 标量，而不是完整 Python decision object。
+   - deterministic objective 规则仍然保留，用于降低 pressure 边界抖动。
 
 ## 后续完整 SOLA 路线
 
@@ -512,17 +529,17 @@ Cd ~= a1 * batch_size + b1 * sum(kv_len) + c1
 
 在加入 prefill 请求前预测未来 KV 峰值，避免高并发下触发 preemption 或 allocator 边界问题。
 
-### Phase 5：TP Rank Broadcast
+### Phase 5：TP Rank Pressure Sync
 
 该项已经在当前实现中落地：
 
 ```text
-rank0 computes SloAwarePrefillDecision
-broadcast decision to all TP ranks
-all ranks use identical objective/chunk/yield decision
+all ranks compute local PressureState
+all_reduce(MAX) produces one global PressureState
+all ranks derive identical objective/chunk/yield decision locally
 ```
 
-后续可以继续优化 broadcast payload，或把 SLO decision 与其它 scheduler control-plane 状态合并同步。
+后续可以继续把 SLO pressure 与其它 scheduler control-plane 状态合并同步，或按固定采样周期降低同步频率。
 
 ## 当前验证
 
@@ -538,4 +555,5 @@ python3 test/registered/unit/managers/test_slo_aware_prefill.py
 - TTFT pressure 高时恢复 prefill capacity；
 - chunked prefill yield 给 decode；
 - ambiguous low-pressure 场景默认 TTFT；
-- 避免 sticky `tpot` 导致 TP rank 分歧。
+- 避免 sticky `tpot` 导致 TP rank 分歧；
+- 低于 SLO 但 TPOT 相对更紧时仍自适应切换到 `tpot`。

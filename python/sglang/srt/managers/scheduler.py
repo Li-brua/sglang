@@ -174,7 +174,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.slo_aware_prefill import (
     SloAwarePrefillController,
-    SloAwarePrefillDecision,
+    SloAwarePrefillPressureState,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -2884,15 +2884,23 @@ class Scheduler(
 
         prefill_max_requests = self.server_args.prefill_max_requests
         if self.slo_prefill_controller is not None:
-            slo_prefill_decision = self.slo_prefill_controller.make_decision(
-                waiting_queue=self.waiting_queue,
-                running_batch=self.running_batch,
-                chunked_req=self.chunked_req,
-                default_chunked_prefill_size=chunked_prefill_size,
-                default_prefill_max_requests=prefill_max_requests,
+            slo_prefill_pressure_state = (
+                self.slo_prefill_controller.compute_pressure_state(
+                    waiting_queue=self.waiting_queue,
+                    running_batch=self.running_batch,
+                    chunked_req=self.chunked_req,
+                )
             )
-            slo_prefill_decision = self._sync_slo_prefill_decision(
-                slo_prefill_decision
+            slo_prefill_pressure_state = self._sync_slo_prefill_pressure_state(
+                slo_prefill_pressure_state
+            )
+            slo_prefill_decision = (
+                self.slo_prefill_controller.make_decision_from_pressure_state(
+                    pressure_state=slo_prefill_pressure_state,
+                    chunked_req=self.chunked_req,
+                    default_chunked_prefill_size=chunked_prefill_size,
+                    default_prefill_max_requests=prefill_max_requests,
+                )
             )
             self.slo_prefill_log_ct += 1
             should_log_slo_prefill = (
@@ -3299,11 +3307,29 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
-    def _sync_slo_prefill_decision(self, decision: SloAwarePrefillDecision):
+    def _sync_slo_prefill_pressure_state(
+        self, pressure_state: SloAwarePrefillPressureState
+    ) -> SloAwarePrefillPressureState:
         if self.tp_group.world_size == 1:
-            return decision
-        return self.tp_group.broadcast_object(
-            decision if self.tp_group.rank_in_group == 0 else None, src=0
+            return pressure_state
+
+        pressure_tensor = torch.tensor(
+            [
+                pressure_state.ttft_pressure,
+                pressure_state.tpot_pressure,
+                1.0 if pressure_state.has_decode_work else 0.0,
+            ],
+            dtype=torch.float32,
+        )
+        torch.distributed.all_reduce(
+            pressure_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.tp_cpu_group,
+        )
+        return SloAwarePrefillPressureState(
+            ttft_pressure=float(pressure_tensor[0].item()),
+            tpot_pressure=float(pressure_tensor[1].item()),
+            has_decode_work=bool(pressure_tensor[2].item() > 0.0),
         )
 
     @scheduler_nvtx_method("scheduler.run_batch")

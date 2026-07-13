@@ -24,6 +24,13 @@ class SloAwarePrefillDecision:
     yield_prefill_to_decode: bool
 
 
+@dataclass(frozen=True)
+class SloAwarePrefillPressureState:
+    ttft_pressure: float
+    tpot_pressure: float
+    has_decode_work: bool
+
+
 class SloAwarePrefillController:
     """A lightweight SOLA-inspired controller for prefill admission.
 
@@ -68,10 +75,43 @@ class SloAwarePrefillController:
         default_chunked_prefill_size: Optional[int],
         default_prefill_max_requests: Optional[int],
     ) -> SloAwarePrefillDecision:
+        pressure_state = self.compute_pressure_state(
+            waiting_queue=waiting_queue,
+            running_batch=running_batch,
+            chunked_req=chunked_req,
+        )
+        return self.make_decision_from_pressure_state(
+            pressure_state=pressure_state,
+            chunked_req=chunked_req,
+            default_chunked_prefill_size=default_chunked_prefill_size,
+            default_prefill_max_requests=default_prefill_max_requests,
+        )
+
+    def compute_pressure_state(
+        self,
+        *,
+        waiting_queue: Sequence["Req"],
+        running_batch: "ScheduleBatch",
+        chunked_req: Optional["Req"],
+    ) -> SloAwarePrefillPressureState:
         now = time.perf_counter()
-        ttft_pressure = self._ttft_pressure(now, waiting_queue, chunked_req)
-        has_decode_work = self._has_decode_work(running_batch.reqs)
-        tpot_pressure = self._tpot_pressure(now, running_batch.reqs)
+        return SloAwarePrefillPressureState(
+            ttft_pressure=self._ttft_pressure(now, waiting_queue, chunked_req),
+            tpot_pressure=self._tpot_pressure(now, running_batch.reqs),
+            has_decode_work=self._has_decode_work(running_batch.reqs),
+        )
+
+    def make_decision_from_pressure_state(
+        self,
+        *,
+        pressure_state: SloAwarePrefillPressureState,
+        chunked_req: Optional["Req"],
+        default_chunked_prefill_size: Optional[int],
+        default_prefill_max_requests: Optional[int],
+    ) -> SloAwarePrefillDecision:
+        ttft_pressure = pressure_state.ttft_pressure
+        tpot_pressure = pressure_state.tpot_pressure
+        has_decode_work = pressure_state.has_decode_work
         smoothed_ttft_pressure, smoothed_tpot_pressure = self._update_pressure(
             ttft_pressure, tpot_pressure
         )

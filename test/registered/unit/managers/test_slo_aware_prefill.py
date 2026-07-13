@@ -13,6 +13,7 @@ assert _SPEC.loader is not None
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 SloAwarePrefillController = _MODULE.SloAwarePrefillController
+SloAwarePrefillPressureState = _MODULE.SloAwarePrefillPressureState
 
 
 class FakeReq:
@@ -109,6 +110,25 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertTrue(decision.allow_prefill)
         self.assertFalse(decision.yield_prefill_to_decode)
         self.assertEqual(decision.objective, "ttft")
+
+    def test_synced_pressure_keeps_pre_slo_tpot_adaptive(self):
+        controller = self.create_controller()
+
+        decision = controller.make_decision_from_pressure_state(
+            pressure_state=SloAwarePrefillPressureState(
+                ttft_pressure=0.10,
+                tpot_pressure=0.30,
+                has_decode_work=True,
+            ),
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "tpot")
+        self.assertFalse(decision.allow_prefill)
+        self.assertTrue(decision.yield_prefill_to_decode)
+        self.assertEqual(decision.chunked_prefill_size, 128)
 
     def test_decode_pressure_allows_limited_prefill_after_ttft_slo(self):
         controller = self.create_controller()
