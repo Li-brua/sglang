@@ -217,13 +217,17 @@ controller 根据 objective 和 pressure 动态缩放 `chunked_prefill_size`。
 
 ```text
 no active decode:
-    chunk = base_chunk or 0.75 * base_chunk
+    chunk = base_chunk
 
 objective=tpot:
-    if ttft_pressure < 1:
+    if ttft_pressure < hard_yield_ttft_pressure:
         chunk = min_chunk
-    else:
+    elif ttft_pressure < 1:
         chunk = 0.25 * base_chunk
+    elif ttft_pressure < 2:
+        chunk = 0.5 * base_chunk
+    else:
+        chunk = 0.75 * base_chunk
 
 objective=ttft:
     if tpot_pressure >= 1.5 and ttft_pressure < tpot_pressure:
@@ -254,6 +258,8 @@ min_chunk_size <= chunk <= base_chunk <= max_prefill_tokens
 prefill_max_requests = 1
 ```
 
+这表示即使 TPOT 更紧，也保留一个受限 prefill 通道，避免长 prompt 在高并发下被 decode 长时间饿死。
+
 在 `objective=ttft` 时，通常保留用户原始 `prefill_max_requests`，使高并发下 TTFT 能恢复。
 
 如果 TPOT pressure 非常高，并且 TTFT pressure 仍然低于 TPOT pressure，则即使在 `objective=ttft` 下也会临时限制 prefill 请求数。
@@ -265,7 +271,7 @@ prefill_max_requests = 1
 ```text
 objective=tpot
 has_decode_work=True
-ttft_pressure < 1.0
+ttft_pressure < hard_yield_ttft_pressure  # 当前为 0.50
 ```
 
 controller 设置：
@@ -276,7 +282,9 @@ yield_to_decode=True
 
 scheduler 收到该决策后返回 `None`，从而让 `get_next_batch_to_run()` 走 decode path。
 
-这解决了一个关键问题：已有 `chunked_req` 不应该连续占据所有 iteration，否则 decode token 会被多个 prefill chunk 阻塞，导致 TPOT p99 上升。
+`hard_yield_ttft_pressure` 是 TTFT slack 保护阈值，不是 TPOT objective 切换阈值。TPOT 低于 SLO 但相对更紧时仍可切到 `objective=tpot`，只是不会在 TTFT 已经接近 SLO 时完全停止 prefill。
+
+这解决了两个关键问题：已有 `chunked_req` 不应该连续占据所有 iteration，否则 decode token 会被多个 prefill chunk 阻塞；同时长 prompt 也不能在高并发下被 decode 长时间饿死。
 
 ## `allow_prefill` 与 `yield_to_decode`
 
@@ -419,7 +427,7 @@ curl -s http://127.0.0.1:30000/metrics | grep -E "num_running_reqs|num_queue_req
 
 ```text
 objective=ttft
-chunk=0.75 * base_chunk or base_chunk
+chunk=base_chunk
 ```
 
 目标是快速消化 prefill。
@@ -428,9 +436,9 @@ chunk=0.75 * base_chunk or base_chunk
 
 ```text
 objective=tpot
-yield_to_decode=True
-chunk=min_chunk
 prefill_max_requests=1
+chunk=min_chunk / 0.25x / 0.5x / 0.75x by TTFT slack
+yield_to_decode=True only when TTFT has enough slack
 ```
 
 目标是让 decode 插队，降低 TPOT p90/p99。

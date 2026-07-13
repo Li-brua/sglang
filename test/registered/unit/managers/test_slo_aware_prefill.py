@@ -60,7 +60,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
             prefill_priority_boost=True,
         )
 
-    def test_decode_pressure_delays_prefill_before_ttft_slo(self):
+    def test_decode_pressure_limits_prefill_before_ttft_slo(self):
         controller = self.create_controller()
         running = SimpleNamespace(
             reqs=[
@@ -80,11 +80,28 @@ class TestSloAwarePrefillController(unittest.TestCase):
             default_prefill_max_requests=None,
         )
 
-        self.assertFalse(decision.allow_prefill)
-        self.assertEqual(decision.chunked_prefill_size, 128)
+        self.assertTrue(decision.allow_prefill)
+        self.assertEqual(decision.chunked_prefill_size, 256)
         self.assertEqual(decision.max_prefill_requests, 1)
         self.assertTrue(decision.has_decode_work)
-        self.assertTrue(decision.yield_prefill_to_decode)
+        self.assertFalse(decision.yield_prefill_to_decode)
+
+    def test_no_decode_uses_full_prefill_chunk(self):
+        controller = self.create_controller()
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.1)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "ttft")
+        self.assertTrue(decision.allow_prefill)
+        self.assertEqual(decision.chunked_prefill_size, 1024)
+        self.assertFalse(decision.yield_prefill_to_decode)
 
     def test_balanced_slack_allows_prefill(self):
         controller = self.create_controller()
@@ -151,7 +168,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertTrue(decision.allow_prefill)
-        self.assertEqual(decision.chunked_prefill_size, 256)
+        self.assertEqual(decision.chunked_prefill_size, 512)
         self.assertEqual(decision.max_prefill_requests, 1)
         self.assertTrue(decision.has_decode_work)
         self.assertFalse(decision.yield_prefill_to_decode)

@@ -61,6 +61,7 @@ class SloAwarePrefillController:
         self.prefill_priority_boost = prefill_priority_boost
         self.pressure_alpha = 0.25
         self.objective_margin = 0.10
+        self.hard_yield_ttft_pressure = 0.50
         self._has_pressure_sample = False
         self._ttft_pressure_ema = 0.0
         self._tpot_pressure_ema = 0.0
@@ -135,11 +136,10 @@ class SloAwarePrefillController:
         )
 
         if objective == "tpot" and has_decode_work:
-            if ttft_pressure < 1.0:
+            max_prefill_requests = 1
+            if ttft_pressure < self.hard_yield_ttft_pressure:
                 allow_prefill = False
                 yield_prefill_to_decode = True
-            else:
-                max_prefill_requests = 1
 
         if chunked_req is not None:
             allow_prefill = True
@@ -221,9 +221,16 @@ class SloAwarePrefillController:
         has_decode_work: bool,
     ) -> int:
         if not has_decode_work:
-            scale = 1.0 if ttft_pressure >= 1.0 else 0.75
+            scale = 1.0
         elif objective == "tpot":
-            scale = 0.0 if ttft_pressure < 1.0 else 0.25
+            if ttft_pressure < self.hard_yield_ttft_pressure:
+                scale = 0.0
+            elif ttft_pressure < 1.0:
+                scale = 0.25
+            elif ttft_pressure < 2.0:
+                scale = 0.5
+            else:
+                scale = 0.75
         elif tpot_pressure >= 1.5 and ttft_pressure < tpot_pressure:
             scale = 0.25
         elif tpot_pressure >= 1.0:
