@@ -2980,9 +2980,9 @@ class Scheduler(
                 slo_prefill_decision.yield_prefill_to_decode
                 and self.chunked_req is not None
             ):
-                return None
+                return None, running_batch
             if not slo_prefill_decision.allow_prefill:
-                return None
+                return None, running_batch
             chunked_prefill_size = slo_prefill_decision.chunked_prefill_size
             prefill_max_requests = slo_prefill_decision.max_prefill_requests
             self._prioritize_slo_prefill_waiting_queue()
