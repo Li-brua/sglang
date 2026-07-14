@@ -3518,7 +3518,10 @@ class Scheduler(
                 )
 
         max_by_tokens = max(1, self.max_total_num_tokens // max(context_len + 1, 1))
-        max_batch_size = max(1, min(self.max_running_requests, max_by_tokens))
+        max_by_req_slots = max(1, self.req_to_token_pool.available_size())
+        max_batch_size = max(
+            1, min(self.max_running_requests, max_by_tokens, max_by_req_slots)
+        )
         sizes = sorted(
             set(int(size) for size in raw_sizes if 0 < int(size) <= max_batch_size)
         )
@@ -3636,15 +3639,46 @@ class Scheduler(
 
     def _release_slo_profile_reqs(self, reqs: List[Req]) -> None:
         for req in reqs:
-            try:
-                release_kv_cache(req, self.tree_cache, is_insert=False)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to release SLO profile request %s: %s",
-                    req.rid,
-                    exc,
-                    exc_info=True,
-                )
+            self._force_release_slo_profile_req(req)
+
+    def _force_release_slo_profile_req(self, req: Req) -> None:
+        if req.req_pool_idx is None:
+            return
+
+        req_pool_idx = req.req_pool_idx
+        try:
+            kv_len = max(req.kv_allocated_len, req.kv_committed_len, 0)
+            if kv_len > 0:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req_pool_idx, :kv_len
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+            if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
+                self.req_to_token_pool, "free_mamba_cache"
+            ):
+                self.req_to_token_pool.free_mamba_cache(req)
+        except Exception as exc:
+            logger.debug(
+                "Failed to release SLO profile KV for %s: %s",
+                req.rid,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            if req.req_pool_idx is not None:
+                try:
+                    self.req_to_token_pool.free(req)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to release SLO profile req slot for %s: %s",
+                        req.rid,
+                        exc,
+                        exc_info=True,
+                    )
+            req.kv_allocated_len = 0
+            req.kv_committed_len = 0
+            req.kv_committed_freed = True
+            req.kv_overallocated_freed = True
 
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(

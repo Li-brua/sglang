@@ -167,7 +167,7 @@ server_args.cuda_graph_config.decode.bs
 
 如果该字段为空，则按 `ServerArgs._generate_decode_cuda_graph_batch_sizes(max_bs)` 生成。也可以通过 `--slo-prefill-profile-decode-batch-sizes` 显式指定。
 
-每个 Cd 点会构造 `batch_size` 个 synthetic request，先用 `--slo-prefill-profile-decode-context-len` 填充 KV，再执行一次真实 decode forward 并记录耗时。超过 KV/token pool 能力的 batch size 会被过滤。
+每个 Cd 点会构造 `batch_size` 个 synthetic request，先用 `--slo-prefill-profile-decode-context-len` 填充 KV，再执行一次真实 decode forward 并记录耗时。超过 KV/token pool 或 req slot 能力的 batch size 会在采样前过滤，避免启动阶段为了 profile 申请超过本 rank 可承载的 synthetic requests。
 
 ### 使用方式
 
@@ -195,6 +195,7 @@ controller.set_startup_cost_profile(
 - pipeline parallelism 暂跳过。
 - speculative decoding 暂跳过，回退在线 EMA。
 - 任一点采样失败只丢弃该点并打印 warning。
+- 每个 synthetic request 在采样后直接释放 KV、Mamba sidecar 和 req slot，不走 prefix cache insert/finished path，避免启动 profiling 污染或耗尽线上 pool。
 - 所有点失败时回退默认/在线成本模型。
 
 ## Workload 控制
