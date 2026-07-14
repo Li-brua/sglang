@@ -1106,6 +1106,8 @@ class Scheduler(
                 f"{not self.server_args.disable_slo_prefill_online_cost_model}, "
                 f"startup_profiling="
                 f"{not self.server_args.disable_slo_prefill_startup_profiling}, "
+                f"profile_decode_context_lens="
+                f"{self._slo_profile_decode_context_lens_arg()}, "
                 f"yield_guard_ratio={self.server_args.slo_prefill_yield_guard_ratio}, "
                 f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
                 f"effective_min_chunk_size="
@@ -2965,6 +2967,14 @@ class Scheduler(
                     f"prefill_cost_ms_per_1k="
                     f"{slo_prefill_decision.prefill_cost_per_token_s * 1e6:.3f}, "
                     f"decode_cost_ms={slo_prefill_decision.decode_cost_s * 1e3:.3f}, "
+                    f"decode_context_len={slo_prefill_decision.decode_context_len}, "
+                    f"ttft_remaining_prefill_cost_ms="
+                    f"{slo_prefill_decision.ttft_remaining_prefill_cost_s * 1e3:.3f}, "
+                    f"ttft_slack_ms={slo_prefill_decision.ttft_slack_s * 1e3:.3f}, "
+                    f"yield_rhs_ms={slo_prefill_decision.yield_rhs_s * 1e3:.3f}, "
+                    f"yield_guard_ms={slo_prefill_decision.yield_guard_s * 1e3:.3f}, "
+                    f"min_prefill_cost_ms="
+                    f"{slo_prefill_decision.min_prefill_cost_s * 1e3:.3f}, "
                     f"waiting={len(self.waiting_queue)}, "
                     f"running={len(self.running_batch.reqs)}"
                 )
@@ -3381,6 +3391,8 @@ class Scheduler(
                 1.0 if pressure_state.has_decode_work else 0.0,
                 pressure_state.prefill_cost_per_token_s,
                 pressure_state.decode_cost_s,
+                float(pressure_state.decode_context_len),
+                pressure_state.ttft_remaining_prefill_cost_s,
             ],
             dtype=torch.float32,
         )
@@ -3405,6 +3417,8 @@ class Scheduler(
             has_decode_work=bool(pressure_tensor[2].item() > 0.0),
             prefill_cost_per_token_s=float(pressure_tensor[3].item()),
             decode_cost_s=float(pressure_tensor[4].item()),
+            decode_context_len=int(pressure_tensor[5].item()),
+            ttft_remaining_prefill_cost_s=float(pressure_tensor[6].item()),
         )
 
     def _profile_slo_prefill_costs(self) -> None:
@@ -3434,7 +3448,7 @@ class Scheduler(
             return
 
         prefill_points: List[Tuple[int, float]] = []
-        decode_points: List[Tuple[int, float]] = []
+        decode_points: List[Tuple[int, int, float]] = []
         try:
             self._warmup_slo_profile_forward()
             for num_tokens in self._slo_profile_prefill_sizes():
@@ -3450,21 +3464,25 @@ class Scheduler(
                     continue
                 prefill_points.append((num_tokens, cost_ms))
 
-            decode_context_len = self.server_args.slo_prefill_profile_decode_context_len
-            for batch_size in self._slo_profile_decode_batch_sizes(decode_context_len):
-                try:
-                    cost_ms = self._profile_slo_decode_cost(
-                        batch_size, decode_context_len
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "SLO prefill startup Cd profiling failed for batch_size=%d: %s",
-                        batch_size,
-                        exc,
-                        exc_info=logger.isEnabledFor(logging.DEBUG),
-                    )
-                    continue
-                decode_points.append((batch_size, cost_ms))
+            for decode_context_len in self._slo_profile_decode_context_lens():
+                for batch_size in self._slo_profile_decode_batch_sizes(
+                    decode_context_len
+                ):
+                    try:
+                        cost_ms = self._profile_slo_decode_cost(
+                            batch_size, decode_context_len
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "SLO prefill startup Cd profiling failed for "
+                            "context_len=%d, batch_size=%d: %s",
+                            decode_context_len,
+                            batch_size,
+                            exc,
+                            exc_info=logger.isEnabledFor(logging.DEBUG),
+                        )
+                        continue
+                    decode_points.append((decode_context_len, batch_size, cost_ms))
         except Exception as exc:
             logger.warning(
                 "SLO prefill startup cost profiling failed; fallback to online cost model: %s",
@@ -3482,12 +3500,12 @@ class Scheduler(
 
         self.slo_prefill_controller.set_startup_cost_profile(
             prefill_cost_ms=prefill_points,
-            decode_cost_ms=decode_points,
+            decode_cost_by_context_ms=decode_points,
         )
         logger.info(
             "SLO prefill startup cost profile: Cp(ms)=%s, Cd(ms)=%s",
             [(tokens, round(cost_ms, 3)) for tokens, cost_ms in prefill_points],
-            [(batch_size, round(cost_ms, 3)) for batch_size, cost_ms in decode_points],
+            self._format_slo_decode_cost_points(decode_points),
         )
 
     def _warmup_slo_profile_forward(self) -> None:
@@ -3507,6 +3525,39 @@ class Scheduler(
         if not sizes or sizes[-1] != upper:
             sizes.append(upper)
         return sorted(set(size for size in sizes if size > 0))
+
+    def _slo_profile_decode_context_lens_arg(self) -> List[int]:
+        return self.server_args.slo_prefill_profile_decode_context_lens or [
+            self.server_args.slo_prefill_profile_decode_context_len
+        ]
+
+    def _slo_profile_decode_context_lens(self) -> List[int]:
+        explicit_lens = self.server_args.slo_prefill_profile_decode_context_lens
+        raw_lens = (
+            explicit_lens
+            if explicit_lens is not None
+            else [self.server_args.slo_prefill_profile_decode_context_len]
+        )
+        max_context_len = max(
+            1, min(self.max_req_input_len - 1, self.max_total_num_tokens - 1)
+        )
+        return sorted(
+            set(
+                max(1, min(int(context_len), max_context_len))
+                for context_len in raw_lens
+            )
+        )
+
+    def _format_slo_decode_cost_points(
+        self, decode_points: List[Tuple[int, int, float]]
+    ) -> List[Tuple[int, List[Tuple[int, float]]]]:
+        grouped: dict[int, List[Tuple[int, float]]] = {}
+        for context_len, batch_size, cost_ms in decode_points:
+            grouped.setdefault(context_len, []).append((batch_size, round(cost_ms, 3)))
+        return [
+            (context_len, sorted(points))
+            for context_len, points in sorted(grouped.items())
+        ]
 
     def _slo_profile_decode_batch_sizes(self, context_len: int) -> List[int]:
         explicit_sizes = self.server_args.slo_prefill_profile_decode_batch_sizes

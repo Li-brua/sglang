@@ -766,8 +766,12 @@ class ServerArgs:
     ] = 2048
     slo_prefill_profile_decode_context_len: A[
         int,
-        "Synthetic context length per request for startup SLO decode Cd profiling.",
+        "Synthetic context length per request for startup SLO decode Cd profiling when context length buckets are not specified.",
     ] = 128
+    slo_prefill_profile_decode_context_lens: A[
+        Optional[List[int]],
+        "Synthetic context length buckets per request for startup SLO decode Cd profiling.",
+    ] = None
     slo_prefill_profile_decode_batch_sizes: A[
         Optional[List[int]],
         "Explicit decode batch sizes for startup SLO Cd profiling. Defaults to captured decode cuda graph sizes.",
@@ -6558,6 +6562,13 @@ class ServerArgs:
             if self.slo_prefill_profile_decode_context_len <= 0:
                 raise ValueError(
                     "--slo-prefill-profile-decode-context-len must be positive."
+                )
+            if self.slo_prefill_profile_decode_context_lens is not None and any(
+                context_len <= 0
+                for context_len in self.slo_prefill_profile_decode_context_lens
+            ):
+                raise ValueError(
+                    "--slo-prefill-profile-decode-context-lens values must be positive."
                 )
             if self.slo_prefill_yield_guard_ratio < 0:
                 raise ValueError("--slo-prefill-yield-guard-ratio must be non-negative.")

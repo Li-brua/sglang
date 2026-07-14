@@ -21,6 +21,7 @@
 --disable-slo-prefill-startup-profiling
 --slo-prefill-profile-prefill-step-size <int>
 --slo-prefill-profile-decode-context-len <int>
+--slo-prefill-profile-decode-context-lens <int...>
 --slo-prefill-profile-decode-batch-sizes <int...>
 ```
 
@@ -48,23 +49,25 @@ sglang serve \
 - `--slo-prefill-ttft-stat` / `--slo-prefill-tpot-stat` 控制 pressure 口径，可用 `p90` 或 `mean` 对齐压测 SLO。
 - `--slo-prefill-yield-guard-ratio` 是 TTFT slack 安全垫，默认 `0.05`，表示至少保留 `5% * TTFT_SLO` 的额外余量。
 - 启动 cost profiling 默认开启；如遇到不支持场景或 profile 失败，会自动回退到初始值 + 在线 EMA。
+- 长上下文 decode 场景建议显式传入多个 Cd context bucket，例如 `--slo-prefill-profile-decode-context-lens 4096 8192 16384 32768`；如果不传该列表，则保持兼容，只使用 `--slo-prefill-profile-decode-context-len` 的单个长度。
 
 ## 状态机
 
 每轮 prefill admission 前，scheduler 会计算并同步一个 `SloAwarePrefillPressureState`：
 
 ```text
-(ttft_pressure, tpot_pressure, has_decode_work, prefill_cost, decode_cost)
+(ttft_pressure, tpot_pressure, has_decode_work, prefill_cost, decode_cost, decode_context_len, ttft_remaining_prefill_cost)
 ```
 
 ### TTFT Pressure
 
 ```text
-per_req_ttft_pressure = prefill_wait_time / ttft_slo
+remaining_prefill_cost = Cp(remaining_prompt_tokens)
+per_req_ttft_pressure = (prefill_wait_time + remaining_prefill_cost) / ttft_slo
 ttft_pressure = aggregate(per_req_ttft_pressure, stat=max|mean|p90)
 ```
 
-waiting queue 中尚未 prefill 的请求以及正在 chunked prefill 的请求都会参与统计。
+waiting queue 中尚未 prefill 的请求以及正在 chunked prefill 的请求都会参与统计。这里不是只看已经等待多久，而是把预计还要花在 prefill 上的时间也算进去；否则长 prompt 会等到接近 TTFT SLO 时才切回 prefill，最终 p90 TTFT 很容易超标。
 
 ### TPOT Pressure
 
@@ -116,13 +119,13 @@ ttft_pressure < hard_yield_ttft_pressure
 ```text
 can_yield_to_decode =
     (1 - ttft_pressure) * ttft_slo
-    > Cd(batch) + Cp(min_chunk) + guard
+    > Cd(batch, kv_len_bucket) + Cp(min_chunk) + guard
 ```
 
 含义：
 
-- `(1 - ttft_pressure) * ttft_slo`：当前 TTFT 余量。
-- `Cd(batch)`：按当前 decode batch size 估计的一次 decode forward 开销。
+- `(1 - ttft_pressure) * ttft_slo`：当前 TTFT 余量；这里的 `ttft_pressure` 已包含预计剩余 prefill 成本。
+- `Cd(batch, kv_len_bucket)`：按当前 decode batch size 和最大运行中 decode 序列长度估计的一次 decode forward 开销。
 - `Cp(min_chunk)`：至少推进一个最小 prefill chunk 的开销。
 - `guard`：安全垫，吸收采样误差、queue 抖动和同步开销。
 
@@ -130,7 +133,7 @@ can_yield_to_decode =
 
 ```text
 guard = max(
-  2 * Cd(batch),
+  2 * Cd(batch, kv_len_bucket),
   0.2 * Cp(min_chunk),
   yield_guard_ratio * ttft_slo,
 )
@@ -143,8 +146,8 @@ guard = max(
 SLO controller 需要两个成本表：
 
 ```text
-Cp(tokens)      # prefill chunk tokens -> prefill forward latency
-Cd(batch_size)  # decode batch size -> decode forward latency
+Cp(tokens)                  # prefill chunk tokens -> prefill forward latency
+Cd(context_len, batch_size)  # decode KV length bucket + batch size -> decode forward latency
 ```
 
 这些表会在服务启动阶段自动在线估计，不需要手动脚本。
@@ -161,6 +164,8 @@ Cd(batch_size)  # decode batch size -> decode forward latency
 
 ### Cd 表
 
+Cd 现在按 `context_len + batch_size` 二维建模。`context_len` 表示 synthetic request 预填充后的 KV 长度桶，用来避免只在短上下文采样导致长上下文 decode 开销被低估。
+
 decode batch size 默认来自已配置/捕获的 decode CUDA graph batch sizes：
 
 ```text
@@ -169,7 +174,9 @@ server_args.cuda_graph_config.decode.bs
 
 如果该字段为空，则按 `ServerArgs._generate_decode_cuda_graph_batch_sizes(max_bs)` 生成。也可以通过 `--slo-prefill-profile-decode-batch-sizes` 显式指定。
 
-每个 Cd 点会构造 `batch_size` 个 synthetic request，先用 `--slo-prefill-profile-decode-context-len` 填充 KV，再执行一次真实 decode forward 并记录耗时。超过 KV/token pool 或 req slot 能力的 batch size 会在采样前过滤，避免启动阶段为了 profile 申请超过本 rank 可承载的 synthetic requests。
+`context_len` 默认使用兼容参数 `--slo-prefill-profile-decode-context-len` 的单个值；如果设置了 `--slo-prefill-profile-decode-context-lens`，则按该列表采样多个 KV 长度桶。
+
+每个 Cd 点会构造 `batch_size` 个 synthetic request，先填充到对应 `context_len`，再执行一次真实 decode forward 并记录耗时。超过 KV/token pool 或 req slot 能力的 batch size 会在采样前过滤，避免启动阶段为了 profile 申请超过本 rank 可承载的 synthetic requests。
 
 ### 使用方式
 
@@ -178,14 +185,14 @@ server_args.cuda_graph_config.decode.bs
 ```text
 controller.set_startup_cost_profile(
   prefill_cost_ms=[(tokens, latency_ms), ...],
-  decode_cost_ms=[(batch_size, latency_ms), ...],
+  decode_cost_by_context_ms=[(context_len, batch_size, latency_ms), ...],
 )
 ```
 
 运行时：
 
 - `Cp(x)` 使用表内线性插值，超出范围时按末端斜率外推。
-- `Cd(batch)` 使用 decode 表按 batch size 插值。
+- `Cd(context_len, batch_size)` 先按当前 decode 请求最大 `seqlen` 选择/插值 context bucket，再在该 bucket 内按 batch size 插值；超过最大 context bucket 时按末端非负斜率外推。
 - 在线 EMA 仍会继续更新低维 fallback cost；启动表失败或缺失时使用 fallback。
 
 ### Best Effort 与跳过条件
@@ -231,7 +238,7 @@ if can_yield_to_decode:
 
 ```text
 tpot_slack = (1 - tpot_pressure) * tpot_slo
-prefill_budget_time = tpot_slack - Cd(batch) - prefill_guard
+prefill_budget_time = tpot_slack - Cd(batch, kv_len_bucket) - prefill_guard
 chunk = Cp^-1(prefill_budget_time)
 chunk = clamp_and_floor_to_tile(chunk, min_chunk, base_chunk)
 ```
@@ -240,7 +247,7 @@ chunk = clamp_and_floor_to_tile(chunk, min_chunk, base_chunk)
 
 ```text
 prefill_guard = max(
-  0.5 * Cd(batch),
+  0.5 * Cd(batch, kv_len_bucket),
   0.2 * Cp(min_chunk),
   yield_guard_ratio * tpot_slo,
 )
@@ -296,7 +303,7 @@ SLO prefill startup cost profile: Cp(ms)=[...], Cd(ms)=[...]
 运行时关键日志：
 
 ```text
-SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=..., chunk=..., prefill_max_requests=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=..., waiting=..., running=...
+SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=..., chunk=..., prefill_max_requests=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=..., decode_context_len=..., ttft_remaining_prefill_cost_ms=..., ttft_slack_ms=..., yield_rhs_ms=..., yield_guard_ms=..., min_prefill_cost_ms=..., waiting=..., running=...
 ```
 
 其中：
@@ -304,14 +311,17 @@ SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=
 - `yield_to_decode=True` 表示本轮可让 decode 插队。
 - `allow=True, yield_to_decode=True` 可能同时出现，通常表示存在 chunked request，但 scheduler 会优先按 `yield_to_decode` 让 decode 先跑。
 - `prefill_cost_ms_per_1k` 是当前低维 fallback cost；真实 chunk 预算优先使用启动 Cp 表。
-- `decode_cost_ms` 是按当前 decode batch size 估计/同步后的 Cd。
+- `decode_cost_ms` 是按当前 decode batch size 和 `decode_context_len` 估计/同步后的 Cd。
+- `decode_context_len` 是当前 running decode 请求的最大 `seqlen`，DP/TP 同步后取最大值。
+- `ttft_remaining_prefill_cost_ms` 是按 Cp 表估计的剩余 prefill 时间，已经计入 `ttft_pressure`。
+- `ttft_slack_ms` 与 `yield_rhs_ms` 分别是 yield 公式左右两边，便于判断为什么本轮让 decode 插队或继续 prefill。
 
 ## 已知限制
 
 - 当前仍是状态机 + closed-form budget，不是完整 SOLA constrained solver。
 - 启动 profiling 暂不覆盖 speculative decoding / PP / disaggregation。
 - `chunked_prefill_size` 仍是静态上限；后续可改为基于当前 KV/token pool 峰值预测动态求 `memory_cap_chunk`。
-- `Cp/Cd` 表目前只按 token 数和 batch size 建模，尚未区分 KV 长度、prefix cache hit、MoE routing、batch 内序列长度分布等特征。
+- `Cp/Cd` 表已覆盖 prefill token 数、decode batch size 和 decode KV 长度桶；尚未区分 prefix cache hit、MoE routing、batch 内序列长度分布等特征。
 - Percentile SLO 目前通过 pressure 聚合口径近似，没有实现完整 percentile-level relaxation。
 
 ## 验证

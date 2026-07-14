@@ -198,6 +198,29 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertTrue(decision.has_decode_work)
         self.assertFalse(decision.yield_prefill_to_decode)
 
+    def test_ttft_pressure_includes_remaining_prefill_cost(self):
+        controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(128, 100.0), (1024, 800.0)],
+            decode_cost_ms=[(1, 10.0)],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertGreater(decision.ttft_pressure, 0.95)
+        self.assertAlmostEqual(
+            decision.ttft_remaining_prefill_cost_s,
+            0.8,
+            delta=0.05,
+        )
+
     def test_no_decode_uses_full_prefill_chunk(self):
         controller = self.create_controller()
         running = SimpleNamespace(reqs=[])
@@ -320,6 +343,51 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertFalse(decision.allow_prefill)
         self.assertTrue(decision.yield_prefill_to_decode)
         self.assertAlmostEqual(decision.decode_cost_s, 0.02)
+
+    def test_contextual_decode_cost_interpolates_context_buckets(self):
+        controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(128, 10.0)],
+            decode_cost_by_context_ms=[
+                (128, 1, 10.0),
+                (128, 4, 20.0),
+                (16384, 1, 100.0),
+                (16384, 4, 120.0),
+            ],
+        )
+
+        midpoint = (128 + 16384) // 2
+
+        self.assertAlmostEqual(controller._decode_cost_for_batch(1, 128), 0.010)
+        self.assertAlmostEqual(controller._decode_cost_for_batch(1, 16384), 0.100)
+        self.assertAlmostEqual(
+            controller._decode_cost_for_batch(1, midpoint),
+            0.055,
+            delta=1e-6,
+        )
+        self.assertAlmostEqual(controller._decode_cost_for_batch(4, 16384), 0.120)
+
+    def test_compute_pressure_uses_runtime_decode_context_len(self):
+        controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(128, 10.0)],
+            decode_cost_by_context_ms=[
+                (128, 1, 10.0),
+                (32768, 1, 90.0),
+            ],
+        )
+        running = SimpleNamespace(
+            reqs=[FakeReq(prefill_finished_s=0.01, output_len=1, seqlen=32768)]
+        )
+
+        pressure_state = controller.compute_pressure_state(
+            waiting_queue=[],
+            running_batch=running,
+            chunked_req=None,
+        )
+
+        self.assertEqual(pressure_state.decode_context_len, 32768)
+        self.assertAlmostEqual(pressure_state.decode_cost_s, 0.090)
 
     def test_online_cost_model_expands_chunk_with_fast_prefill(self):
         controller = self.create_controller()
