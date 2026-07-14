@@ -730,6 +730,32 @@ class ServerArgs:
         Optional[float],
         "TPOT SLO in milliseconds for --enable-slo-aware-prefill.",
     ] = None
+    slo_prefill_ttft_stat: A[
+        str,
+        Arg(
+            help="Statistic used to aggregate TTFT pressure for --enable-slo-aware-prefill.",
+            choices=["max", "mean", "p90"],
+        ),
+    ] = "max"
+    slo_prefill_tpot_stat: A[
+        str,
+        Arg(
+            help="Statistic used to aggregate TPOT pressure for --enable-slo-aware-prefill.",
+            choices=["max", "mean", "p90"],
+        ),
+    ] = "max"
+    slo_prefill_initial_prefill_cost_ms_per_1k: A[
+        Optional[float],
+        "Warm-start prefill cost for --enable-slo-aware-prefill in milliseconds per 1K input tokens.",
+    ] = None
+    slo_prefill_initial_decode_cost_ms: A[
+        Optional[float],
+        "Warm-start decode iteration cost for --enable-slo-aware-prefill in milliseconds.",
+    ] = None
+    disable_slo_prefill_online_cost_model: A[
+        bool,
+        "Disable online EMA cost updates for --enable-slo-aware-prefill and use the initial/default costs.",
+    ] = False
     slo_prefill_tile_size: A[
         int,
         "Tile multiple used when rounding SLO-aware dynamic prefill chunk sizes.",
@@ -6483,6 +6509,26 @@ class ServerArgs:
                 raise ValueError("--slo-prefill-ttft-slo-ms must be positive.")
             if self.slo_prefill_tpot_slo_ms <= 0:
                 raise ValueError("--slo-prefill-tpot-slo-ms must be positive.")
+            if self.slo_prefill_ttft_stat not in ("max", "mean", "p90"):
+                raise ValueError(
+                    "--slo-prefill-ttft-stat must be one of max, mean, p90."
+                )
+            if self.slo_prefill_tpot_stat not in ("max", "mean", "p90"):
+                raise ValueError(
+                    "--slo-prefill-tpot-stat must be one of max, mean, p90."
+                )
+            if (
+                self.slo_prefill_initial_prefill_cost_ms_per_1k is not None
+                and self.slo_prefill_initial_prefill_cost_ms_per_1k <= 0
+            ):
+                raise ValueError(
+                    "--slo-prefill-initial-prefill-cost-ms-per-1k must be positive."
+                )
+            if (
+                self.slo_prefill_initial_decode_cost_ms is not None
+                and self.slo_prefill_initial_decode_cost_ms <= 0
+            ):
+                raise ValueError("--slo-prefill-initial-decode-cost-ms must be positive.")
             if self.slo_prefill_tile_size <= 0:
                 raise ValueError("--slo-prefill-tile-size must be positive.")
             if (

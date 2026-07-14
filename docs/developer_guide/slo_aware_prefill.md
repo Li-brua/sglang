@@ -26,6 +26,11 @@ SOLA 的核心思想是：每个 iteration 都根据当前系统状态决定调�
 --enable-slo-aware-prefill
 --slo-prefill-ttft-slo-ms <float>
 --slo-prefill-tpot-slo-ms <float>
+--slo-prefill-ttft-stat <max|mean|p90>
+--slo-prefill-tpot-stat <max|mean|p90>
+--slo-prefill-initial-prefill-cost-ms-per-1k <float>
+--slo-prefill-initial-decode-cost-ms <float>
+--disable-slo-prefill-online-cost-model
 --slo-prefill-tile-size <int>
 --slo-prefill-min-chunk-size <int>
 --disable-slo-prefill-priority-boost
@@ -40,8 +45,10 @@ sglang serve \
   --enable-metrics \
   --chunked-prefill-size 8192 \
   --enable-slo-aware-prefill \
-  --slo-prefill-ttft-slo-ms 2000 \
-  --slo-prefill-tpot-slo-ms 50 \
+  --slo-prefill-ttft-slo-ms 10000 \
+  --slo-prefill-ttft-stat p90 \
+  --slo-prefill-tpot-slo-ms 60 \
+  --slo-prefill-tpot-stat mean \
   --slo-prefill-min-chunk-size 512 \
   --slo-prefill-tile-size 128
 ```
@@ -53,6 +60,11 @@ sglang serve \
 - 当前实现把 `--chunked-prefill-size` 视为静态 `base_chunk` / 安全上限，SLO controller 只会在 `[slo_min_chunk, base_chunk]` 内动态缩放。
 - 更符合 SOLA 的后续设计是：开启 SLO-aware 后不再把用户传入的 `--chunked-prefill-size` 当最终上限，而是由 peak memory prediction 计算当前 iteration 的 `memory_cap_chunk`，再用 `min(user_cap, memory_cap_chunk)` 或直接 `memory_cap_chunk` 作为动态上限。
 - `--slo-prefill-ttft-slo-ms` 和 `--slo-prefill-tpot-slo-ms` 是必填目标值。
+- `--slo-prefill-ttft-stat` / `--slo-prefill-tpot-stat` 决定 controller 用 `max`、`mean` 还是 `p90` 聚合当前请求压力；默认 `max` 保持旧行为。
+- 如果目标是 `TTFT p90 <= 10s`，建议使用 `--slo-prefill-ttft-stat p90 --slo-prefill-ttft-slo-ms 10000`。
+- 如果目标是 decode 输出吞吐约 `15 token/s`，可近似为 `TPOT mean <= 1000/15 = 66.7ms`，例如 `--slo-prefill-tpot-stat mean --slo-prefill-tpot-slo-ms 60~67`。
+- `--slo-prefill-initial-prefill-cost-ms-per-1k` 和 `--slo-prefill-initial-decode-cost-ms` 可用预采样脚本 warm-start cost model。
+- `--disable-slo-prefill-online-cost-model` 会固定使用初始/default cost，适合在线 EMA 被 wall-clock/log interval 污染时排障。
 - `--slo-prefill-min-chunk-size` 决定 TPOT 保护模式下的最小 prefill chunk。
 
 ## 总体架构
@@ -98,13 +110,16 @@ TTFT pressure 表示当前 prefill 请求距离 TTFT SLO 的压力。
 当前近似实现：
 
 ```text
-ttft_pressure = max_prefill_wait_time / ttft_slo
+per_req_ttft_pressure = prefill_wait_time / ttft_slo
+ttft_pressure = aggregate(per_req_ttft_pressure, stat=max|mean|p90)
 ```
 
-其中 `max_prefill_wait_time` 来自：
+其中每个请求的 `prefill_wait_time` 来自：
 
 - waiting queue 中所有尚未 prefill 的请求；
 - 当前正在 chunked prefill 中的 `chunked_req`。
+
+`aggregate` 默认是 `max`，也可以通过 `--slo-prefill-ttft-stat mean|p90` 切到 mean 或 p90 口径。
 
 如果：
 
@@ -129,7 +144,8 @@ TPOT pressure 表示当前 decode 请求距离 TPOT SLO 的压力。
 ```text
 decode_gap = now - last_decode_finish_time
 historical_avg_tpot = (last_decode_finish_time - prefill_finished_time) / decoded_tokens
-tpot_pressure = max(decode_gap, historical_avg_tpot) / tpot_slo
+per_req_tpot_pressure = max(decode_gap, historical_avg_tpot) / tpot_slo
+tpot_pressure = aggregate(per_req_tpot_pressure, stat=max|mean|p90)
 ```
 
 这样做的原因是：
@@ -137,6 +153,8 @@ tpot_pressure = max(decode_gap, historical_avg_tpot) / tpot_slo
 - 只看 historical average TPOT 会反应太慢；
 - 短输出请求只有几个 decode token，很可能请求结束前 controller 还没感知到 TPOT 变差；
 - `decode_gap` 能捕捉当前 decode 被 prefill 阻塞的实时风险。
+
+`aggregate` 默认是 `max`，也可以通过 `--slo-prefill-tpot-stat mean|p90` 切到 mean 或 p90 口径。
 
 如果：
 
@@ -220,12 +238,30 @@ Cp ~= prefill_cost_per_token * prefill_tokens
 Cd ~= decode_cost_per_iteration
 ```
 
-当前实现使用 EMA 更新：
+当前实现支持两种 cost 来源：
 
-- 纯 prefill batch：用 prefill 日志间隔和 `#new-token` 更新 `prefill_cost_per_token`。
-- decode batch：用 decode 日志间隔除以 `decode_log_interval` 更新 `decode_cost_per_iteration`。
+- **预采样 warm-start**：通过 `--slo-prefill-initial-prefill-cost-ms-per-1k` 和 `--slo-prefill-initial-decode-cost-ms` 注入初始 `Cp/Cd`。
+- **在线 EMA**：纯 prefill batch 用 prefill 日志间隔和 `#new-token` 更新 `prefill_cost_per_token`；decode batch 用 decode 日志间隔除以 `decode_log_interval` 更新 `decode_cost_per_iteration`。
 - mixed prefill batch 暂不用于拟合 `Cp`，避免被中间 decode 间隔污染。
 - TP group 同步 pressure 时也同步 cost 标量，确保各 TP rank 使用同一组预测输入。
+- 如果线上 EMA 明显漂移，可使用 `--disable-slo-prefill-online-cost-model` 固定预采样 cost。
+
+预采样脚本示例：
+
+```bash
+python3 scripts/slo_prefill_cost_probe.py \
+  --url http://127.0.0.1:30000/v1/chat/completions \
+  --model /mnt/models/deepseek-ai/DeepSeek-V4-Flash \
+  --input-len 8000 \
+  --decode-output-len 128 \
+  --concurrency 4 \
+  --num-requests 24 \
+  --ttft-stat p90 \
+  --ttft-slo-ms 10000 \
+  --target-decode-throughput 15
+```
+
+脚本会输出推荐参数，包括 `--slo-prefill-tpot-slo-ms`、`--slo-prefill-initial-prefill-cost-ms-per-1k` 和 `--slo-prefill-initial-decode-cost-ms`。
 
 ### Dynamic Chunk Size
 
@@ -442,8 +478,8 @@ sglang serve \
 关键日志：
 
 ```text
-SLO-aware prefill enabled: ..., dp_attention=..., hicache=...
-SLO prefill decision: objective=..., allow=..., yield_to_decode=..., chunk=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=...
+SLO-aware prefill enabled: ..., ttft_stat=..., tpot_stat=..., initial_prefill_cost_ms_per_1k=..., initial_decode_cost_ms=..., dp_attention=..., hicache=...
+SLO prefill decision: objective=..., allow=..., yield_to_decode=..., chunk=..., ttft_stat=..., tpot_stat=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=...
 scheduler.status ...
 Prefill batch ...
 Decode batch ...
@@ -513,9 +549,9 @@ prefill_max_requests=None
 | Phase-level prioritization | `objective=ttft/tpot` 控制 prefill/decode 优先级 |
 | Workload size control | 动态 `chunked_prefill_size` 与 `prefill_max_requests` |
 | Request-level prioritization | waiting queue urgency sort |
-| State monitor | TTFT/TPOT pressure + EMA 日志 |
+| State monitor | TTFT/TPOT pressure + mean/p90/max 聚合口径 + EMA 日志 |
 | Constraint conversion | 根据 TTFT/TPOT pressure 切换 objective |
-| Cost model `Cp/Cd` | 已实现轻量在线 EMA 版本，用于 chunk/yield 约束 |
+| Cost model `Cp/Cd` | 已实现预采样 warm-start + 轻量在线 EMA，用于 chunk/yield 约束 |
 | Constrained workload `ki/ni` | 已实现近似 Eq. 1 / Eq. 2 的 token budget 与 prefill cap |
 | Peak memory prediction | 尚未实现；下一步应将其作为 `chunk_upper_bound` 来源 |
 | Output length prediction | 已实现 request-level fallback：基于 `max_new_tokens - generated` |
@@ -568,7 +604,8 @@ Cd ~= a1 * batch_size + b1 * sum(kv_len) + c1
 
 - 引入 prefix/KV 长度特征；
 - 区分 batch size、chunk size、MoE routing 等特征；
-- 使用 device timer 替代 wall-clock log interval。
+- 使用 device timer 替代 wall-clock log interval；
+- 将 `scripts/slo_prefill_cost_probe.py` 的预采样结果持久化为模型/硬件/backend 画像。
 
 ### Phase 3：Constrained Workload
 

@@ -24,6 +24,8 @@ class SloAwarePrefillDecision:
     yield_prefill_to_decode: bool
     prefill_cost_per_token_s: float
     decode_cost_s: float
+    ttft_stat: str
+    tpot_stat: str
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,11 @@ class SloAwarePrefillController:
         tile_size: int,
         min_chunk_size: Optional[int],
         prefill_priority_boost: bool,
+        ttft_stat: str = "max",
+        tpot_stat: str = "max",
+        initial_prefill_cost_ms_per_1k: Optional[float] = None,
+        initial_decode_cost_ms: Optional[float] = None,
+        disable_online_cost_model: bool = False,
     ) -> None:
         self.ttft_slo_s = ttft_slo_ms / 1000.0
         self.tpot_slo_s = tpot_slo_ms / 1000.0
@@ -63,6 +70,8 @@ class SloAwarePrefillController:
         self.min_chunk_size = min_chunk_size or self.tile_size
         self.min_chunk_size = max(self.min_chunk_size, page_size, 1)
         self.prefill_priority_boost = prefill_priority_boost
+        self.ttft_stat = self._normalize_pressure_stat(ttft_stat)
+        self.tpot_stat = self._normalize_pressure_stat(tpot_stat)
         self.pressure_alpha = 0.25
         self.cost_alpha = 0.20
         self.objective_margin = 0.10
@@ -77,8 +86,15 @@ class SloAwarePrefillController:
             self.tpot_slo_s / default_cost_tokens, 1e-6
         )
         self.default_decode_cost_s = max(min(self.tpot_slo_s, 0.05), 1e-4)
+        if initial_prefill_cost_ms_per_1k is not None:
+            self.default_prefill_cost_per_token_s = max(
+                initial_prefill_cost_ms_per_1k / 1_000_000.0, 1e-9
+            )
+        if initial_decode_cost_ms is not None:
+            self.default_decode_cost_s = max(initial_decode_cost_ms / 1000.0, 1e-9)
         self._prefill_cost_per_token_s = self.default_prefill_cost_per_token_s
         self._decode_cost_s = self.default_decode_cost_s
+        self.disable_online_cost_model = disable_online_cost_model
         self._active_prefill_cost_per_token_s = self._prefill_cost_per_token_s
         self._active_decode_cost_s = self._decode_cost_s
         self._has_prefill_cost_sample = False
@@ -186,12 +202,19 @@ class SloAwarePrefillController:
             yield_prefill_to_decode=yield_prefill_to_decode,
             prefill_cost_per_token_s=self._active_prefill_cost_per_token_s,
             decode_cost_s=self._active_decode_cost_s,
+            ttft_stat=self.ttft_stat,
+            tpot_stat=self.tpot_stat,
         )
+
+    def _normalize_pressure_stat(self, stat: str) -> str:
+        if stat not in ("max", "mean", "p90"):
+            raise ValueError(f"Unsupported SLO pressure stat: {stat}")
+        return stat
 
     def observe_batch_cost(
         self, *, prefill_tokens: int, decode_tokens: int, elapsed_s: float
     ) -> None:
-        if elapsed_s <= 0.0:
+        if self.disable_online_cost_model or elapsed_s <= 0.0:
             return
         if prefill_tokens > 0:
             effective_elapsed = elapsed_s
@@ -361,30 +384,43 @@ class SloAwarePrefillController:
     ) -> float:
         if self.ttft_slo_s <= 0:
             return 0.0
-        max_wait = 0.0
+        pressures = []
         for req in self._prefill_candidates(waiting_queue, chunked_req):
             entry = req.time_stats.wait_queue_entry_time or req.time_stats.scheduler_recv_time
             if entry > 0.0:
-                max_wait = max(max_wait, now - entry)
-        return max_wait / self.ttft_slo_s
+                pressures.append((now - entry) / self.ttft_slo_s)
+        return self._aggregate_pressure(pressures, self.ttft_stat)
 
     def _tpot_pressure(self, now: float, running_reqs: Iterable["Req"]) -> float:
         if self.tpot_slo_s <= 0:
             return 0.0
-        max_tpot = 0.0
+        pressures = []
         for req in running_reqs:
             if req.finished() or req.is_retracted or len(req.output_ids) == 0:
                 continue
             start = req.time_stats.prefill_finished_time
             last = req.time_stats.last_decode_finish_time or now
             if start > 0.0:
+                tpot_s = 0.0
                 decode_anchor = req.time_stats.last_decode_finish_time or start
                 if now > decode_anchor:
-                    max_tpot = max(max_tpot, now - decode_anchor)
+                    tpot_s = max(tpot_s, now - decode_anchor)
                 if last > start and len(req.output_ids) > 1:
                     decode_tokens = max(len(req.output_ids) - 1, 1)
-                    max_tpot = max(max_tpot, (last - start) / decode_tokens)
-        return max_tpot / self.tpot_slo_s
+                    tpot_s = max(tpot_s, (last - start) / decode_tokens)
+                pressures.append(tpot_s / self.tpot_slo_s)
+        return self._aggregate_pressure(pressures, self.tpot_stat)
+
+    def _aggregate_pressure(self, pressures: Sequence[float], stat: str) -> float:
+        if len(pressures) == 0:
+            return 0.0
+        if stat == "mean":
+            return sum(pressures) / len(pressures)
+        if stat == "p90":
+            sorted_pressures = sorted(pressures)
+            index = max(math.ceil(0.90 * len(sorted_pressures)) - 1, 0)
+            return sorted_pressures[min(index, len(sorted_pressures) - 1)]
+        return max(pressures)
 
     def _prefill_candidates(
         self, waiting_queue: Sequence["Req"], chunked_req: Optional["Req"]

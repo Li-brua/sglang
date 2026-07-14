@@ -1064,12 +1064,31 @@ class Scheduler(
                 prefill_priority_boost=(
                     not self.server_args.disable_slo_prefill_priority_boost
                 ),
+                ttft_stat=self.server_args.slo_prefill_ttft_stat,
+                tpot_stat=self.server_args.slo_prefill_tpot_stat,
+                initial_prefill_cost_ms_per_1k=(
+                    self.server_args.slo_prefill_initial_prefill_cost_ms_per_1k
+                ),
+                initial_decode_cost_ms=(
+                    self.server_args.slo_prefill_initial_decode_cost_ms
+                ),
+                disable_online_cost_model=(
+                    self.server_args.disable_slo_prefill_online_cost_model
+                ),
             )
             logger.info(
                 "SLO-aware prefill enabled: "
                 f"ttft_slo_ms={self.server_args.slo_prefill_ttft_slo_ms}, "
                 f"tpot_slo_ms={self.server_args.slo_prefill_tpot_slo_ms}, "
+                f"ttft_stat={self.server_args.slo_prefill_ttft_stat}, "
+                f"tpot_stat={self.server_args.slo_prefill_tpot_stat}, "
                 f"base_chunked_prefill_size={self.chunked_prefill_size}, "
+                f"initial_prefill_cost_ms_per_1k="
+                f"{self.server_args.slo_prefill_initial_prefill_cost_ms_per_1k}, "
+                f"initial_decode_cost_ms="
+                f"{self.server_args.slo_prefill_initial_decode_cost_ms}, "
+                f"online_cost_model="
+                f"{not self.server_args.disable_slo_prefill_online_cost_model}, "
                 f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
                 f"tile_size={self.server_args.slo_prefill_tile_size}, "
                 f"dp_attention={self.server_args.enable_dp_attention}, "
@@ -2917,6 +2936,8 @@ class Scheduler(
                     f"has_decode={slo_prefill_decision.has_decode_work}, "
                     f"chunk={slo_prefill_decision.chunked_prefill_size}, "
                     f"prefill_max_requests={slo_prefill_decision.max_prefill_requests}, "
+                    f"ttft_stat={slo_prefill_decision.ttft_stat}, "
+                    f"tpot_stat={slo_prefill_decision.tpot_stat}, "
                     f"ttft_pressure={slo_prefill_decision.ttft_pressure:.3f}, "
                     f"tpot_pressure={slo_prefill_decision.tpot_pressure:.3f}, "
                     f"ttft_ema={slo_prefill_decision.smoothed_ttft_pressure:.3f}, "

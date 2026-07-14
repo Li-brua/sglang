@@ -60,6 +60,86 @@ class TestSloAwarePrefillController(unittest.TestCase):
             prefill_priority_boost=True,
         )
 
+    def test_mean_ttft_pressure_uses_average_wait(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            tile_size=128,
+            min_chunk_size=None,
+            prefill_priority_boost=True,
+            ttft_stat="mean",
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.2), FakeReq(wait_s=0.8)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_pressure, 0.5, delta=0.05)
+        self.assertEqual(decision.ttft_stat, "mean")
+
+    def test_p90_tpot_pressure_ignores_smallest_tail_sample(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            tile_size=128,
+            min_chunk_size=None,
+            prefill_priority_boost=True,
+            tpot_stat="p90",
+        )
+        running = SimpleNamespace(
+            reqs=[
+                FakeReq(prefill_finished_s=0.03, last_decode_finish_s=0.02, output_len=2),
+                FakeReq(prefill_finished_s=0.05, last_decode_finish_s=0.04, output_len=2),
+                FakeReq(prefill_finished_s=0.07, last_decode_finish_s=0.06, output_len=2),
+            ]
+        )
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.1)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertGreater(decision.tpot_pressure, 0.35)
+        self.assertLess(decision.tpot_pressure, 0.70)
+        self.assertEqual(decision.tpot_stat, "p90")
+
+
+    def test_initial_costs_can_be_fixed_by_disabling_online_updates(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            tile_size=128,
+            min_chunk_size=None,
+            prefill_priority_boost=True,
+            initial_prefill_cost_ms_per_1k=20.0,
+            initial_decode_cost_ms=7.0,
+            disable_online_cost_model=True,
+        )
+
+        self.assertAlmostEqual(controller._prefill_cost_per_token_s, 20e-6)
+        self.assertAlmostEqual(controller._decode_cost_s, 0.007)
+        controller.observe_batch_cost(prefill_tokens=1, decode_tokens=0, elapsed_s=10.0)
+        controller.observe_batch_cost(prefill_tokens=0, decode_tokens=1, elapsed_s=10.0)
+        self.assertAlmostEqual(controller._prefill_cost_per_token_s, 20e-6)
+        self.assertAlmostEqual(controller._decode_cost_s, 0.007)
+
     def test_decode_pressure_limits_prefill_before_ttft_slo(self):
         controller = self.create_controller()
         running = SimpleNamespace(
