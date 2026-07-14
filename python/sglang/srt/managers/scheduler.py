@@ -3668,7 +3668,11 @@ class Scheduler(
             global_num_tokens = [num_tokens] * get_attention_dp_size()
             batch.global_num_tokens = global_num_tokens
             batch.global_num_tokens_for_logprob = global_num_tokens
-        batch = self._maybe_prepare_ngram_embedding(batch)
+        ngram_manager = getattr(self, "ngram_embedding_manager", None)
+        if ngram_manager is not None:
+            batch = ngram_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
         return batch
 
     def _run_slo_profile_forward(self, batch: ScheduleBatch) -> float:
