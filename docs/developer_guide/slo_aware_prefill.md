@@ -49,7 +49,9 @@ sglang serve \
 注意：
 
 - `--enable-slo-aware-prefill` 只开启控制器。
-- `--chunked-prefill-size` 仍然需要显式设置，否则不会自动启用 chunked prefill。
+- 当前实现中，`--chunked-prefill-size` 仍然需要显式设置，否则不会自动启用 chunked prefill。
+- 当前实现把 `--chunked-prefill-size` 视为静态 `base_chunk` / 安全上限，SLO controller 只会在 `[slo_min_chunk, base_chunk]` 内动态缩放。
+- 更符合 SOLA 的后续设计是：开启 SLO-aware 后不再把用户传入的 `--chunked-prefill-size` 当最终上限，而是由 peak memory prediction 计算当前 iteration 的 `memory_cap_chunk`，再用 `min(user_cap, memory_cap_chunk)` 或直接 `memory_cap_chunk` 作为动态上限。
 - `--slo-prefill-ttft-slo-ms` 和 `--slo-prefill-tpot-slo-ms` 是必填目标值。
 - `--slo-prefill-min-chunk-size` 决定 TPOT 保护模式下的最小 prefill chunk。
 
@@ -229,17 +231,36 @@ Cd ~= decode_cost_per_iteration
 
 controller 根据 SOLA Eq. 1 / Eq. 2 的约束思想动态缩放 `chunked_prefill_size`。
 
+当前实现中：
+
+```text
+base_chunk = explicit --chunked-prefill-size
+chunk_upper_bound = base_chunk
+```
+
+这保证不会超过用户显式配置，但也意味着如果用户传入的 `--chunked-prefill-size` 偏小，SLO controller 无法利用剩余 KV/显存空间扩大 prefill workload；如果用户传入值偏大，则仍主要依赖 SGLang 原有 admission/allocator 来兜底。
+
+更接近 SOLA 的设计应该把 `base_chunk` 替换为每轮动态上限：
+
+```text
+memory_cap_chunk = predict_max_chunk_from_peak_kv_memory(current_state)
+chunk_upper_bound = memory_cap_chunk
+# 或兼容模式：chunk_upper_bound = min(user_chunked_prefill_size, memory_cap_chunk)
+```
+
+其中 `memory_cap_chunk` 应在考虑 running decode、waiting prefill、page size、KV cache watermark、SWA/full attention token pool 后，预测本轮不触发 allocator failure / retraction / preemption 的最大 chunk。
+
 简化规则：
 
 ```text
 no active decode:
-    chunk = base_chunk
+    chunk = chunk_upper_bound
 
 objective=ttft:
     tpot_slack = (1 - tpot_pressure) * tpot_slo
     chunk = floor_to_tile(tpot_slack / prefill_cost_per_token)
     if TTFT has already violated and TPOT has large slack:
-        chunk = base_chunk
+        chunk = chunk_upper_bound
 
 objective=tpot:
     if TTFT has enough slack for one decode iteration + min prefill chunk:
@@ -251,8 +272,10 @@ objective=tpot:
 最终 chunk 会被约束到：
 
 ```text
-min_chunk_size <= chunk <= base_chunk <= max_prefill_tokens
+min_chunk_size <= chunk <= chunk_upper_bound <= max_prefill_tokens
 ```
+
+当前 `chunk_upper_bound == base_chunk`；引入 peak memory prediction 后，`chunk_upper_bound` 应该变成当前 iteration 的内存安全上限。
 
 并按 `lcm(page_size, tile_size)` 向下对齐。
 
@@ -433,7 +456,7 @@ curl -s http://127.0.0.1:30000/metrics | grep -E "num_running_reqs|num_queue_req
 
 ```text
 objective=ttft
-chunk=base_chunk
+chunk=chunk_upper_bound
 ```
 
 目标是快速消化 prefill。
@@ -453,7 +476,7 @@ yield_to_decode=True only when TTFT has enough slack
 
 ```text
 objective=ttft
-chunk=base_chunk
+chunk=chunk_upper_bound
 prefill_max_requests=None
 ```
 
@@ -482,7 +505,7 @@ prefill_max_requests=None
 | Constraint conversion | 根据 TTFT/TPOT pressure 切换 objective |
 | Cost model `Cp/Cd` | 已实现轻量在线 EMA 版本，用于 chunk/yield 约束 |
 | Constrained workload `ki/ni` | 已实现近似 Eq. 1 / Eq. 2 的 token budget 与 prefill cap |
-| Peak memory prediction | 尚未实现，依赖 SGLang 现有 allocator/admission |
+| Peak memory prediction | 尚未实现；下一步应将其作为 `chunk_upper_bound` 来源 |
 | Output length prediction | 已实现 request-level fallback：基于 `max_new_tokens - generated` |
 | Percentile-level relaxation | 尚未实现 |
 
@@ -500,7 +523,9 @@ prefill_max_requests=None
    - 尚未按输入长度 / max output length 分桶统计真实输出长度分布。
 
 4. **缺少 peak memory prediction**
+   - 当前 `chunk_upper_bound` 仍来自用户显式 `--chunked-prefill-size`。
    - 高并发下 memory 边界仍主要依赖 SGLang 原有 admission 和 allocator。
+   - 更合理的 SOLA-style 实现应根据当前 KV/token pool 剩余容量、watermark、page size 和 running decode 未来 token 需求预测最大安全 chunk。
 
 5. **TP 多进程一致性**
    - 当前同步的是 TP group 内的 pressure 标量，而不是完整 Python decision object。
@@ -544,7 +569,19 @@ Cd ~= a1 * batch_size + b1 * sum(kv_len) + c1
 
 ### Phase 4：Peak Memory Prediction
 
-在加入 prefill 请求前预测未来 KV 峰值，避免高并发下触发 preemption 或 allocator 边界问题。
+在加入 prefill 请求前预测未来 KV 峰值，避免高并发下触发 preemption 或 allocator 边界问题。建议落地为动态 chunk 上限：
+
+```text
+free_pages = token_pool_free_pages - reserved_decode_pages - safety_margin_pages
+memory_cap_chunk = floor_to_tile(free_pages * page_size / schedulable_prefill_reqs)
+chunk_upper_bound = memory_cap_chunk
+```
+
+设计取舍：
+
+- **直接忽略用户 `--chunked-prefill-size`**：最符合自适应，但行为变化较大；用户给小值时也可能被自动放大。
+- **兼容模式 `min(user_cap, memory_cap_chunk)`**：更安全，但如果用户 cap 太小，SLO controller 仍无法充分利用显存。
+- **推荐后续默认**：SLO-aware 开启时使用 `memory_cap_chunk` 作为真正上限，并把用户参数降级为 fallback / debug cap，或者新增 `--slo-prefill-respect-user-chunk-cap` 控制兼容行为。
 
 ### Phase 5：TP Rank Pressure Sync
 
