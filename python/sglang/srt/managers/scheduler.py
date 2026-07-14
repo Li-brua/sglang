@@ -74,9 +74,7 @@ from sglang.srt.layers.attention.mamba.ops import (
 )
 from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
-    get_attention_cp_group,
     get_attention_dp_size,
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import initialize_moe_config
