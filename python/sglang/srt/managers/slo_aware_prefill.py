@@ -25,7 +25,6 @@ class SloAwarePrefillDecision:
     prefill_cost_per_token_s: float
     decode_cost_s: float
     decode_context_len: int
-    ttft_remaining_prefill_cost_s: float
     ttft_slack_s: float
     yield_rhs_s: float
     yield_guard_s: float
@@ -42,7 +41,6 @@ class SloAwarePrefillPressureState:
     prefill_cost_per_token_s: float = 0.0
     decode_cost_s: float = 0.0
     decode_context_len: int = 0
-    ttft_remaining_prefill_cost_s: float = 0.0
 
 
 class SloAwarePrefillController:
@@ -80,6 +78,7 @@ class SloAwarePrefillController:
         self.tile_size = max(tile_size, page_size, 1)
         self.min_chunk_size = self._resolve_min_chunk_size(
             min_chunk_size=min_chunk_size,
+            base_chunked_prefill_size=base_chunked_prefill_size,
             enable_dp_attention=enable_dp_attention,
             dp_size=dp_size,
         )
@@ -125,10 +124,16 @@ class SloAwarePrefillController:
         self,
         *,
         min_chunk_size: Optional[int],
+        base_chunked_prefill_size: Optional[int],
         enable_dp_attention: bool,
         dp_size: int,
     ) -> int:
-        min_chunk = min_chunk_size or self.tile_size
+        if min_chunk_size is None:
+            base_chunk = base_chunked_prefill_size or self.max_prefill_tokens
+            min_chunk = max(math.ceil(base_chunk / 2), self.tile_size)
+        else:
+            min_chunk = min_chunk_size
+
         if enable_dp_attention and min_chunk_size is not None and dp_size > 1:
             min_chunk = math.ceil(min_chunk / dp_size)
         return max(min_chunk, self.page_size, 1)
@@ -164,11 +169,8 @@ class SloAwarePrefillController:
         now = time.perf_counter()
         decode_reqs = self._decode_reqs(running_batch.reqs)
         decode_context_len = self._decode_context_len(decode_reqs)
-        ttft_pressure, ttft_remaining_prefill_cost_s = self._ttft_pressure(
-            now, waiting_queue, chunked_req
-        )
         return SloAwarePrefillPressureState(
-            ttft_pressure=ttft_pressure,
+            ttft_pressure=self._ttft_pressure(now, waiting_queue, chunked_req),
             tpot_pressure=self._tpot_pressure(now, decode_reqs),
             has_decode_work=len(decode_reqs) > 0,
             prefill_cost_per_token_s=self._prefill_cost_per_token_s,
@@ -176,7 +178,6 @@ class SloAwarePrefillController:
                 len(decode_reqs), decode_context_len
             ),
             decode_context_len=decode_context_len,
-            ttft_remaining_prefill_cost_s=ttft_remaining_prefill_cost_s,
         )
 
     def make_decision_from_pressure_state(
@@ -248,9 +249,6 @@ class SloAwarePrefillController:
             prefill_cost_per_token_s=self._active_prefill_cost_per_token_s,
             decode_cost_s=self._active_decode_cost_s,
             decode_context_len=pressure_state.decode_context_len,
-            ttft_remaining_prefill_cost_s=(
-                pressure_state.ttft_remaining_prefill_cost_s
-            ),
             ttft_slack_s=ttft_slack_s,
             yield_rhs_s=yield_rhs_s,
             yield_guard_s=yield_guard_s,
@@ -632,47 +630,18 @@ class SloAwarePrefillController:
 
     def _ttft_pressure(
         self, now: float, waiting_queue: Sequence["Req"], chunked_req: Optional["Req"]
-    ) -> tuple[float, float]:
+    ) -> float:
         if self.ttft_slo_s <= 0:
-            return 0.0, 0.0
+            return 0.0
         pressures = []
-        remaining_prefill_costs_s = []
         for req in self._prefill_candidates(waiting_queue, chunked_req):
             entry = (
                 req.time_stats.wait_queue_entry_time
                 or req.time_stats.scheduler_recv_time
             )
-            if entry <= 0.0:
-                continue
-            remaining_prefill_cost_s = self._estimate_prefill_cost(
-                self._remaining_prefill_tokens(req)
-            )
-            remaining_prefill_costs_s.append(remaining_prefill_cost_s)
-            pressures.append(
-                (now - entry + remaining_prefill_cost_s) / self.ttft_slo_s
-            )
-        return (
-            self._aggregate_pressure(pressures, self.ttft_stat),
-            self._aggregate_pressure(remaining_prefill_costs_s, self.ttft_stat),
-        )
-
-    def _remaining_prefill_tokens(self, req: "Req") -> int:
-        full_ids = getattr(req, "full_untruncated_fill_ids", None)
-        if full_ids is not None and len(full_ids) > 0:
-            total_tokens = len(full_ids)
-        elif hasattr(req, "origin_input_ids"):
-            total_tokens = len(req.origin_input_ids)
-        else:
-            total_tokens = getattr(req, "seqlen", 0)
-
-        processed_tokens = max(getattr(req, "num_matched_prefix_tokens", 0), 0)
-        prefix_indices = getattr(req, "prefix_indices", None)
-        if prefix_indices is not None:
-            processed_tokens = max(processed_tokens, len(prefix_indices))
-        extend_range = getattr(req, "extend_range", None)
-        if extend_range is not None:
-            processed_tokens = max(processed_tokens, extend_range.end)
-        return max(total_tokens - processed_tokens, 0)
+            if entry > 0.0:
+                pressures.append((now - entry) / self.ttft_slo_s)
+        return self._aggregate_pressure(pressures, self.ttft_stat)
 
     def _tpot_pressure(self, now: float, running_reqs: Iterable["Req"]) -> float:
         if self.tpot_slo_s <= 0:

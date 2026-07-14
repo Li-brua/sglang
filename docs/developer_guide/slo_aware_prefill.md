@@ -44,8 +44,8 @@ sglang serve \
 说明：
 
 - `--chunked-prefill-size` 仍作为当前动态 chunk 的静态上限；controller 在 `[min_chunk, chunked_prefill_size]` 内缩放。
-- DP attention 开启时，SGLang 会把 `--chunked-prefill-size` 除以 `dp_size` 转成本地上限；SLO controller 也会把显式传入的 `--slo-prefill-min-chunk-size` 除以 `dp_size`，保持二者同一语义。例如全局 `chunked_prefill_size=32768`、`min_chunk_size=4096`、`dp_size=8` 时，本地范围是 `[512, 4096]`。
-- 如果没有显式传入 `--slo-prefill-min-chunk-size`，默认最小 chunk 仍使用本地 `--slo-prefill-tile-size`，不会再除以 `dp_size`。
+- 如果没有显式传入 `--slo-prefill-min-chunk-size`，默认最小 chunk 是 effective `chunked_prefill_size / 2`，并且不小于本地 `--slo-prefill-tile-size`。例如 `chunked_prefill_size=32768`、`dp_size=8` 时，本地上限是 `4096`，默认本地下限是 `2048`。
+- DP attention 开启时，SGLang 会把 `--chunked-prefill-size` 除以 `dp_size` 转成本地上限；SLO controller 也会把显式传入的 `--slo-prefill-min-chunk-size` 除以 `dp_size`，保持二者同一语义。例如全局 `chunked_prefill_size=32768`、显式 `min_chunk_size=4096`、`dp_size=8` 时，本地范围是 `[512, 4096]`。
 - `--slo-prefill-ttft-stat` / `--slo-prefill-tpot-stat` 控制 pressure 口径，可用 `p90` 或 `mean` 对齐压测 SLO。
 - `--slo-prefill-yield-guard-ratio` 是 TTFT slack 安全垫，默认 `0.05`，表示至少保留 `5% * TTFT_SLO` 的额外余量。
 - 启动 cost profiling 默认开启；如遇到不支持场景或 profile 失败，会自动回退到初始值 + 在线 EMA。
@@ -56,18 +56,17 @@ sglang serve \
 每轮 prefill admission 前，scheduler 会计算并同步一个 `SloAwarePrefillPressureState`：
 
 ```text
-(ttft_pressure, tpot_pressure, has_decode_work, prefill_cost, decode_cost, decode_context_len, ttft_remaining_prefill_cost)
+(ttft_pressure, tpot_pressure, has_decode_work, prefill_cost, decode_cost, decode_context_len)
 ```
 
 ### TTFT Pressure
 
 ```text
-remaining_prefill_cost = Cp(remaining_prompt_tokens)
-per_req_ttft_pressure = (prefill_wait_time + remaining_prefill_cost) / ttft_slo
+per_req_ttft_pressure = prefill_wait_time / ttft_slo
 ttft_pressure = aggregate(per_req_ttft_pressure, stat=max|mean|p90)
 ```
 
-waiting queue 中尚未 prefill 的请求以及正在 chunked prefill 的请求都会参与统计。这里不是只看已经等待多久，而是把预计还要花在 prefill 上的时间也算进去；否则长 prompt 会等到接近 TTFT SLO 时才切回 prefill，最终 p90 TTFT 很容易超标。
+waiting queue 中尚未 prefill 的请求以及正在 chunked prefill 的请求都会参与统计。当前 TTFT pressure 只看已经等待的时间，不再把预计剩余 prefill cost 加进去，避免长 prompt 或 HiCache/offload 场景下因成本高估过早关闭 decode yield。
 
 ### TPOT Pressure
 
@@ -303,7 +302,7 @@ SLO prefill startup cost profile: Cp(ms)=[...], Cd(ms)=[...]
 运行时关键日志：
 
 ```text
-SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=..., chunk=..., prefill_max_requests=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=..., decode_context_len=..., ttft_remaining_prefill_cost_ms=..., ttft_slack_ms=..., yield_rhs_ms=..., yield_guard_ms=..., min_prefill_cost_ms=..., waiting=..., running=...
+SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=..., chunk=..., prefill_max_requests=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=..., decode_context_len=..., ttft_slack_ms=..., yield_rhs_ms=..., yield_guard_ms=..., min_prefill_cost_ms=..., waiting=..., running=...
 ```
 
 其中：
@@ -313,7 +312,6 @@ SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=
 - `prefill_cost_ms_per_1k` 是当前低维 fallback cost；真实 chunk 预算优先使用启动 Cp 表。
 - `decode_cost_ms` 是按当前 decode batch size 和 `decode_context_len` 估计/同步后的 Cd。
 - `decode_context_len` 是当前 running decode 请求的最大 `seqlen`，DP/TP 同步后取最大值。
-- `ttft_remaining_prefill_cost_ms` 是按 Cp 表估计的剩余 prefill 时间，已经计入 `ttft_pressure`。
 - `ttft_slack_ms` 与 `yield_rhs_ms` 分别是 yield 公式左右两边，便于判断为什么本轮让 decode 插队或继续 prefill。
 
 ## 已知限制

@@ -786,7 +786,7 @@ class ServerArgs:
     ] = 128
     slo_prefill_min_chunk_size: A[
         Optional[int],
-        "Minimum dynamic chunk size for --enable-slo-aware-prefill. Defaults to --slo-prefill-tile-size.",
+        "Minimum dynamic chunk size for --enable-slo-aware-prefill. Defaults to half of the effective chunked prefill size, rounded up and at least --slo-prefill-tile-size.",
     ] = None
     disable_slo_prefill_priority_boost: A[
         bool,

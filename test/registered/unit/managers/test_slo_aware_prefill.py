@@ -76,6 +76,11 @@ class TestSloAwarePrefillController(unittest.TestCase):
 
         self.assertEqual(controller.min_chunk_size, 512)
 
+    def test_default_min_chunk_uses_half_base_chunk(self):
+        controller = self.create_controller()
+
+        self.assertEqual(controller.min_chunk_size, 512)
+
     def test_dp_attention_keeps_default_min_chunk_local(self):
         controller = SloAwarePrefillController(
             ttft_slo_ms=1000,
@@ -90,7 +95,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
             dp_size=8,
         )
 
-        self.assertEqual(controller.min_chunk_size, 128)
+        self.assertEqual(controller.min_chunk_size, 2048)
 
     def test_mean_ttft_pressure_uses_average_wait(self):
         controller = SloAwarePrefillController(
@@ -193,12 +198,12 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertTrue(decision.allow_prefill)
-        self.assertEqual(decision.chunked_prefill_size, 128)
+        self.assertEqual(decision.chunked_prefill_size, 512)
         self.assertEqual(decision.max_prefill_requests, 1)
         self.assertTrue(decision.has_decode_work)
         self.assertFalse(decision.yield_prefill_to_decode)
 
-    def test_ttft_pressure_includes_remaining_prefill_cost(self):
+    def test_ttft_pressure_uses_wait_time_only(self):
         controller = self.create_controller()
         controller.set_startup_cost_profile(
             prefill_cost_ms=[(128, 100.0), (1024, 800.0)],
@@ -214,12 +219,8 @@ class TestSloAwarePrefillController(unittest.TestCase):
             default_prefill_max_requests=None,
         )
 
-        self.assertGreater(decision.ttft_pressure, 0.95)
-        self.assertAlmostEqual(
-            decision.ttft_remaining_prefill_cost_s,
-            0.8,
-            delta=0.05,
-        )
+        self.assertAlmostEqual(decision.ttft_pressure, 0.2, delta=0.05)
+        self.assertFalse(hasattr(decision, "ttft_remaining_prefill_cost_s"))
 
     def test_no_decode_uses_full_prefill_chunk(self):
         controller = self.create_controller()
@@ -280,7 +281,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertEqual(decision.objective, "tpot")
         self.assertFalse(decision.allow_prefill)
         self.assertTrue(decision.yield_prefill_to_decode)
-        self.assertEqual(decision.chunked_prefill_size, 128)
+        self.assertEqual(decision.chunked_prefill_size, 512)
 
     def test_tpot_objective_uses_profiled_prefill_budget_when_yield_is_unsafe(self):
         controller = SloAwarePrefillController(
@@ -290,7 +291,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
             max_prefill_tokens=4096,
             page_size=1,
             tile_size=128,
-            min_chunk_size=None,
+            min_chunk_size=128,
             prefill_priority_boost=True,
         )
         controller.set_startup_cost_profile(
@@ -339,7 +340,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertEqual(decision.objective, "tpot")
-        self.assertEqual(decision.chunked_prefill_size, 128)
+        self.assertEqual(decision.chunked_prefill_size, 512)
         self.assertFalse(decision.allow_prefill)
         self.assertTrue(decision.yield_prefill_to_decode)
         self.assertAlmostEqual(decision.decode_cost_s, 0.02)
@@ -427,7 +428,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertEqual(decision.objective, "ttft")
-        self.assertEqual(decision.chunked_prefill_size, 128)
+        self.assertEqual(decision.chunked_prefill_size, 512)
 
     def test_high_ttft_restores_full_chunk_in_ttft_objective(self):
         controller = self.create_controller()
