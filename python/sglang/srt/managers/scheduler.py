@@ -1071,7 +1071,9 @@ class Scheduler(
                 f"tpot_slo_ms={self.server_args.slo_prefill_tpot_slo_ms}, "
                 f"base_chunked_prefill_size={self.chunked_prefill_size}, "
                 f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
-                f"tile_size={self.server_args.slo_prefill_tile_size}"
+                f"tile_size={self.server_args.slo_prefill_tile_size}, "
+                f"dp_attention={self.server_args.enable_dp_attention}, "
+                f"hicache={self.enable_hicache_storage}"
             )
         if self.server_args.enable_prefill_delayer:
             if self.server_args.disaggregation_mode == "decode":
@@ -2934,7 +2936,7 @@ class Scheduler(
                 return None
             chunked_prefill_size = slo_prefill_decision.chunked_prefill_size
             prefill_max_requests = slo_prefill_decision.max_prefill_requests
-            self.slo_prefill_controller.prioritize_waiting_queue(self.waiting_queue)
+            self._prioritize_slo_prefill_waiting_queue()
 
         # Prefill policy
         adder = PrefillAdder(
@@ -3310,12 +3312,27 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _prioritize_slo_prefill_waiting_queue(self) -> None:
+        self.slo_prefill_controller.prioritize_waiting_queue(self.waiting_queue)
+        if not self.enable_hicache_storage or len(self.waiting_queue) <= 1:
+            return
+        self.waiting_queue.sort(key=self._slo_hicache_prefetch_sort_key)
+
+    def _slo_hicache_prefetch_sort_key(self, req: Req) -> int:
+        if len(req.output_ids) > 0:
+            return 0
+        try:
+            return 0 if self.tree_cache.check_prefetch_progress(req.rid) else 1
+        except Exception as exc:
+            logger.debug(
+                "Failed to check HiCache prefetch progress for SLO priority: %s",
+                exc,
+            )
+            return 0
+
     def _sync_slo_prefill_pressure_state(
         self, pressure_state: SloAwarePrefillPressureState
     ) -> SloAwarePrefillPressureState:
-        if self.tp_group.world_size == 1:
-            return pressure_state
-
         pressure_tensor = torch.tensor(
             [
                 pressure_state.ttft_pressure,
@@ -3326,11 +3343,21 @@ class Scheduler(
             ],
             dtype=torch.float32,
         )
-        torch.distributed.all_reduce(
-            pressure_tensor,
-            op=torch.distributed.ReduceOp.MAX,
-            group=self.tp_cpu_group,
-        )
+        if self.server_args.enable_dp_attention:
+            sync_groups = (
+                (self.dp_tp_group, self.dp_tp_cpu_group),
+                (self.attn_cp_group, self.attn_cp_cpu_group),
+            )
+        else:
+            sync_groups = ((self.tp_group, self.tp_cpu_group),)
+        for sync_group, sync_cpu_group in sync_groups:
+            if sync_group.world_size == 1:
+                continue
+            torch.distributed.all_reduce(
+                pressure_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=sync_cpu_group,
+            )
         return SloAwarePrefillPressureState(
             ttft_pressure=float(pressure_tensor[0].item()),
             tpot_pressure=float(pressure_tensor[1].item()),

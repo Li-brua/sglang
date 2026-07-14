@@ -360,13 +360,21 @@ controller 支持 request-level priority boost。
 - 预测值近似为：
 
 ```text
-wait_time + remaining_input_tokens / max_prefill_tokens
+wait_time + estimated_prefill_cost(remaining_input_tokens)
 ```
 
 当 `objective=tpot`：
 
 - waiting queue 中若存在 decode/retracted 请求，则 decode 优先；
-- decode 请求按当前 request-level TPOT pressure 排序。
+- decode 请求按预测 TPOT 排序，预测项包含当前 TPOT、在线 `decode_cost` 和剩余输出长度 fallback。
+
+开启 HiCache 时，SLO priority sort 之后还会做一个稳定的 prefetch-ready 分组：
+
+- storage prefetch 已完成或无需 prefetch 的请求保持在前面；
+- storage prefetch 仍在进行的请求稳定移动到后面；
+- 同一组内部仍保留 SLO priority 的相对顺序。
+
+这样避免 SLO 把未完成 prefetch 的长 prompt 反复排到队头，导致 scheduler 在 HiCache prefetch 未完成时频繁 skip。
 
 如果需要关闭该排序：
 
@@ -392,8 +400,8 @@ TP3 objective=ttft, yield_to_decode=False
 当前修复不是给 TPOT 增加固定切换阈值，也不是广播完整 Python decision object，而是同步 objective 的输入状态：
 
 ```text
-local PressureState = (ttft_pressure, tpot_pressure, has_decode_work)
-global PressureState = TP all_reduce(MAX, local PressureState)
+local PressureState = (ttft_pressure, tpot_pressure, has_decode_work, prefill_cost, decode_cost)
+global PressureState = all_reduce(MAX, local PressureState)
 all ranks compute SloAwarePrefillDecision from global PressureState
 ```
 
@@ -401,8 +409,10 @@ all ranks compute SloAwarePrefillDecision from global PressureState
 
 - 保留自适应：即使 TPOT 尚未达到 SLO，只要它相对 TTFT 更紧，仍然可以切到 `objective=tpot`。
 - 避免 rank 分歧：objective、chunk、yield、prefill request cap 都来自同一组 global pressure。
-- 避免 Python object broadcast：同步的是 3 个 float/bool 标量，当前使用 CPU tensor `all_reduce(MAX)`，不触碰 GPU stream。
-- 采用保守聚合：任一 TP rank 看到更高 TTFT/TPOT pressure，全组都按更高压力处理。
+- 避免 Python object broadcast：同步的是 pressure/cost float 标量，当前使用 CPU tensor `all_reduce(MAX)`，不触碰 GPU stream。
+- 采用保守聚合：任一 rank 看到更高 TTFT/TPOT pressure 或更高 cost，全组都按更高压力/成本处理。
+- 普通 TP：在 `tp_group` 内同步。
+- DP attention：先在 `dp_tp_group`（attention TP group）内同步，再在 `attn_cp_group` 内同步，避免 DP attention / context parallel ranks 做出不同调度决策。
 
 同时仍保留：
 
@@ -432,8 +442,8 @@ sglang serve \
 关键日志：
 
 ```text
-SLO-aware prefill enabled: ...
-SLO prefill decision: objective=..., allow=..., yield_to_decode=..., chunk=..., ttft_pressure=..., tpot_pressure=...
+SLO-aware prefill enabled: ..., dp_attention=..., hicache=...
+SLO prefill decision: objective=..., allow=..., yield_to_decode=..., chunk=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=...
 scheduler.status ...
 Prefill batch ...
 Decode batch ...
