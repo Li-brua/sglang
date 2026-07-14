@@ -43,6 +43,8 @@ sglang serve \
 说明：
 
 - `--chunked-prefill-size` 仍作为当前动态 chunk 的静态上限；controller 在 `[min_chunk, chunked_prefill_size]` 内缩放。
+- DP attention 开启时，SGLang 会把 `--chunked-prefill-size` 除以 `dp_size` 转成本地上限；SLO controller 也会把显式传入的 `--slo-prefill-min-chunk-size` 除以 `dp_size`，保持二者同一语义。例如全局 `chunked_prefill_size=32768`、`min_chunk_size=4096`、`dp_size=8` 时，本地范围是 `[512, 4096]`。
+- 如果没有显式传入 `--slo-prefill-min-chunk-size`，默认最小 chunk 仍使用本地 `--slo-prefill-tile-size`，不会再除以 `dp_size`。
 - `--slo-prefill-ttft-stat` / `--slo-prefill-tpot-stat` 控制 pressure 口径，可用 `p90` 或 `mean` 对齐压测 SLO。
 - `--slo-prefill-yield-guard-ratio` 是 TTFT slack 安全垫，默认 `0.05`，表示至少保留 `5% * TTFT_SLO` 的额外余量。
 - 启动 cost profiling 默认开启；如遇到不支持场景或 profile 失败，会自动回退到初始值 + 在线 EMA。

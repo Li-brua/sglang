@@ -61,6 +61,8 @@ class SloAwarePrefillController:
         initial_decode_cost_ms: Optional[float] = None,
         disable_online_cost_model: bool = False,
         yield_guard_ratio: float = 0.05,
+        enable_dp_attention: bool = False,
+        dp_size: int = 1,
     ) -> None:
         self.ttft_slo_s = ttft_slo_ms / 1000.0
         self.tpot_slo_s = tpot_slo_ms / 1000.0
@@ -68,8 +70,11 @@ class SloAwarePrefillController:
         self.max_prefill_tokens = max_prefill_tokens
         self.page_size = page_size
         self.tile_size = max(tile_size, page_size, 1)
-        self.min_chunk_size = min_chunk_size or self.tile_size
-        self.min_chunk_size = max(self.min_chunk_size, page_size, 1)
+        self.min_chunk_size = self._resolve_min_chunk_size(
+            min_chunk_size=min_chunk_size,
+            enable_dp_attention=enable_dp_attention,
+            dp_size=dp_size,
+        )
         self.prefill_priority_boost = prefill_priority_boost
         self.ttft_stat = self._normalize_pressure_stat(ttft_stat)
         self.tpot_stat = self._normalize_pressure_stat(tpot_stat)
@@ -106,6 +111,18 @@ class SloAwarePrefillController:
         self._ttft_pressure_ema = 0.0
         self._tpot_pressure_ema = 0.0
         self._last_objective = "ttft"
+
+    def _resolve_min_chunk_size(
+        self,
+        *,
+        min_chunk_size: Optional[int],
+        enable_dp_attention: bool,
+        dp_size: int,
+    ) -> int:
+        min_chunk = min_chunk_size or self.tile_size
+        if enable_dp_attention and min_chunk_size is not None and dp_size > 1:
+            min_chunk = math.ceil(min_chunk / dp_size)
+        return max(min_chunk, self.page_size, 1)
 
     def make_decision(
         self,

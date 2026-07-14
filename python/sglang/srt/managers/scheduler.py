@@ -1088,6 +1088,8 @@ class Scheduler(
                     self.server_args.disable_slo_prefill_online_cost_model
                 ),
                 yield_guard_ratio=self.server_args.slo_prefill_yield_guard_ratio,
+                enable_dp_attention=self.server_args.enable_dp_attention,
+                dp_size=self.server_args.dp_size,
             )
             logger.info(
                 "SLO-aware prefill enabled: "
@@ -1106,6 +1108,8 @@ class Scheduler(
                 f"{not self.server_args.disable_slo_prefill_startup_profiling}, "
                 f"yield_guard_ratio={self.server_args.slo_prefill_yield_guard_ratio}, "
                 f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
+                f"effective_min_chunk_size="
+                f"{self.slo_prefill_controller.min_chunk_size}, "
                 f"tile_size={self.server_args.slo_prefill_tile_size}, "
                 f"dp_attention={self.server_args.enable_dp_attention}, "
                 f"hicache={self.enable_hicache_storage}"

@@ -60,6 +60,38 @@ class TestSloAwarePrefillController(unittest.TestCase):
             prefill_priority_boost=True,
         )
 
+    def test_dp_attention_normalizes_min_chunk_to_local_budget(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=4096,
+            max_prefill_tokens=4096,
+            page_size=1,
+            tile_size=128,
+            min_chunk_size=4096,
+            prefill_priority_boost=True,
+            enable_dp_attention=True,
+            dp_size=8,
+        )
+
+        self.assertEqual(controller.min_chunk_size, 512)
+
+    def test_dp_attention_keeps_default_min_chunk_local(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=4096,
+            max_prefill_tokens=4096,
+            page_size=1,
+            tile_size=128,
+            min_chunk_size=None,
+            prefill_priority_boost=True,
+            enable_dp_attention=True,
+            dp_size=8,
+        )
+
+        self.assertEqual(controller.min_chunk_size, 128)
+
     def test_mean_ttft_pressure_uses_average_wait(self):
         controller = SloAwarePrefillController(
             ttft_slo_ms=1000,
