@@ -67,6 +67,7 @@ class SloAwarePrefillController:
         self.cost_alpha = 0.20
         self.objective_margin = 0.10
         self.hard_yield_ttft_pressure = 0.50
+        self.hard_prefill_ttft_pressure = 1.50
         default_cost_tokens = max(
             self.base_chunked_prefill_size or self.max_prefill_tokens,
             self.min_chunk_size,
@@ -287,6 +288,8 @@ class SloAwarePrefillController:
     ) -> int:
         if self.tpot_slo_s <= 0.0:
             return base_chunk
+        if ttft_pressure >= self.hard_prefill_ttft_pressure:
+            return base_chunk
         if tpot_pressure >= 1.0 and ttft_pressure < tpot_pressure:
             return self.min_chunk_size
 
@@ -300,8 +303,8 @@ class SloAwarePrefillController:
         return max(self.min_chunk_size, min(base_chunk, token_budget))
 
     def _tpot_objective_token_budget(self, base_chunk: int, ttft_pressure: float) -> int:
-        if ttft_pressure >= 2.0:
-            return int(base_chunk * 0.75)
+        if ttft_pressure >= self.hard_prefill_ttft_pressure:
+            return base_chunk
         if ttft_pressure >= 1.0:
             return int(base_chunk * 0.5)
 

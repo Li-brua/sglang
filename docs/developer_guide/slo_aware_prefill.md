@@ -263,7 +263,9 @@ objective=ttft:
         chunk = chunk_upper_bound
 
 objective=tpot:
-    if TTFT has enough slack for one decode iteration + min prefill chunk:
+    if TTFT pressure >= hard_prefill_ttft_pressure:
+        chunk = chunk_upper_bound
+    elif TTFT has enough slack for one decode iteration + min prefill chunk:
         yield_to_decode=True
     else:
         chunk = the minimum prefill budget needed to keep TTFT moving
@@ -287,7 +289,7 @@ min_chunk_size <= chunk <= chunk_upper_bound <= max_prefill_tokens
 prefill_max_requests = 1
 ```
 
-这表示即使 TPOT 更紧，也保留一个受限 prefill 通道，避免长 prompt 在高并发下被 decode 长时间饿死。
+这表示即使 TPOT 更紧，也保留一个受限 prefill 通道，避免长 prompt 在高并发下被 decode 长时间饿死。当 TTFT pressure 达到 `hard_prefill_ttft_pressure`（当前为 1.5）后，即使 objective 仍为 `tpot`，chunk 也会恢复到 `chunk_upper_bound`，防止高并发下 prefill throughput 崩掉。
 
 在 `objective=ttft` 时，通常保留用户原始 `prefill_max_requests`，使高并发下 TTFT 能恢复。
 
@@ -480,7 +482,7 @@ chunk=chunk_upper_bound
 prefill_max_requests=None
 ```
 
-目标是避免过度保护 TPOT 造成 prefill starvation。
+目标是避免过度保护 TPOT 造成 prefill starvation；如果 TTFT pressure 继续升高到 `hard_prefill_ttft_pressure`，即使 TPOT 更紧也会临时恢复大 chunk。
 
 ### 两者都超 SLO
 

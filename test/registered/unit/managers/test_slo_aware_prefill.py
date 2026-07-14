@@ -187,6 +187,41 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertEqual(decision.objective, "ttft")
         self.assertEqual(decision.chunked_prefill_size, 128)
 
+    def test_high_ttft_restores_full_chunk_in_ttft_objective(self):
+        controller = self.create_controller()
+
+        decision = controller.make_decision_from_pressure_state(
+            pressure_state=SloAwarePrefillPressureState(
+                ttft_pressure=1.6,
+                tpot_pressure=1.2,
+                has_decode_work=True,
+            ),
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "ttft")
+        self.assertEqual(decision.chunked_prefill_size, 1024)
+
+    def test_high_ttft_restores_full_chunk_even_in_tpot_objective(self):
+        controller = self.create_controller()
+
+        decision = controller.make_decision_from_pressure_state(
+            pressure_state=SloAwarePrefillPressureState(
+                ttft_pressure=1.6,
+                tpot_pressure=1.8,
+                has_decode_work=True,
+            ),
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "tpot")
+        self.assertEqual(decision.chunked_prefill_size, 1024)
+        self.assertEqual(decision.max_prefill_requests, 1)
+
     def test_decode_pressure_allows_limited_prefill_after_ttft_slo(self):
         controller = self.create_controller()
         running = SimpleNamespace(
