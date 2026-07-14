@@ -147,6 +147,46 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertTrue(decision.yield_prefill_to_decode)
         self.assertEqual(decision.chunked_prefill_size, 128)
 
+    def test_online_cost_model_expands_chunk_with_fast_prefill(self):
+        controller = self.create_controller()
+        controller.observe_batch_cost(prefill_tokens=2048, decode_tokens=0, elapsed_s=0.02)
+
+        decision = controller.make_decision_from_pressure_state(
+            pressure_state=SloAwarePrefillPressureState(
+                ttft_pressure=0.8,
+                tpot_pressure=0.2,
+                has_decode_work=True,
+                prefill_cost_per_token_s=controller._prefill_cost_per_token_s,
+                decode_cost_s=controller._decode_cost_s,
+            ),
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "ttft")
+        self.assertEqual(decision.chunked_prefill_size, 1024)
+
+    def test_online_cost_model_constrains_chunk_with_high_tpot_pressure(self):
+        controller = self.create_controller()
+        controller.observe_batch_cost(prefill_tokens=128, decode_tokens=0, elapsed_s=0.2)
+
+        decision = controller.make_decision_from_pressure_state(
+            pressure_state=SloAwarePrefillPressureState(
+                ttft_pressure=0.7,
+                tpot_pressure=0.75,
+                has_decode_work=True,
+                prefill_cost_per_token_s=controller._prefill_cost_per_token_s,
+                decode_cost_s=controller._decode_cost_s,
+            ),
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "ttft")
+        self.assertEqual(decision.chunked_prefill_size, 128)
+
     def test_decode_pressure_allows_limited_prefill_after_ttft_slo(self):
         controller = self.create_controller()
         running = SimpleNamespace(

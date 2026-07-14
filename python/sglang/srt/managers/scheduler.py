@@ -2919,6 +2919,9 @@ class Scheduler(
                     f"tpot_pressure={slo_prefill_decision.tpot_pressure:.3f}, "
                     f"ttft_ema={slo_prefill_decision.smoothed_ttft_pressure:.3f}, "
                     f"tpot_ema={slo_prefill_decision.smoothed_tpot_pressure:.3f}, "
+                    f"prefill_cost_ms_per_1k="
+                    f"{slo_prefill_decision.prefill_cost_per_token_s * 1e6:.3f}, "
+                    f"decode_cost_ms={slo_prefill_decision.decode_cost_s * 1e3:.3f}, "
                     f"waiting={len(self.waiting_queue)}, "
                     f"running={len(self.running_batch.reqs)}"
                 )
@@ -3318,6 +3321,8 @@ class Scheduler(
                 pressure_state.ttft_pressure,
                 pressure_state.tpot_pressure,
                 1.0 if pressure_state.has_decode_work else 0.0,
+                pressure_state.prefill_cost_per_token_s,
+                pressure_state.decode_cost_s,
             ],
             dtype=torch.float32,
         )
@@ -3330,6 +3335,8 @@ class Scheduler(
             ttft_pressure=float(pressure_tensor[0].item()),
             tpot_pressure=float(pressure_tensor[1].item()),
             has_decode_work=bool(pressure_tensor[2].item() > 0.0),
+            prefill_cost_per_token_s=float(pressure_tensor[3].item()),
+            decode_cost_s=float(pressure_tensor[4].item()),
         )
 
     @scheduler_nvtx_method("scheduler.run_batch")

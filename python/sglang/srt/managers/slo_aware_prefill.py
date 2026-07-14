@@ -22,6 +22,8 @@ class SloAwarePrefillDecision:
     smoothed_tpot_pressure: float
     has_decode_work: bool
     yield_prefill_to_decode: bool
+    prefill_cost_per_token_s: float
+    decode_cost_s: float
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,8 @@ class SloAwarePrefillPressureState:
     ttft_pressure: float
     tpot_pressure: float
     has_decode_work: bool
+    prefill_cost_per_token_s: float = 0.0
+    decode_cost_s: float = 0.0
 
 
 class SloAwarePrefillController:
@@ -60,8 +64,24 @@ class SloAwarePrefillController:
         self.min_chunk_size = max(self.min_chunk_size, page_size, 1)
         self.prefill_priority_boost = prefill_priority_boost
         self.pressure_alpha = 0.25
+        self.cost_alpha = 0.20
         self.objective_margin = 0.10
         self.hard_yield_ttft_pressure = 0.50
+        default_cost_tokens = max(
+            self.base_chunked_prefill_size or self.max_prefill_tokens,
+            self.min_chunk_size,
+            1,
+        )
+        self.default_prefill_cost_per_token_s = max(
+            self.tpot_slo_s / default_cost_tokens, 1e-6
+        )
+        self.default_decode_cost_s = max(min(self.tpot_slo_s, 0.05), 1e-4)
+        self._prefill_cost_per_token_s = self.default_prefill_cost_per_token_s
+        self._decode_cost_s = self.default_decode_cost_s
+        self._active_prefill_cost_per_token_s = self._prefill_cost_per_token_s
+        self._active_decode_cost_s = self._decode_cost_s
+        self._has_prefill_cost_sample = False
+        self._has_decode_cost_sample = False
         self._has_pressure_sample = False
         self._ttft_pressure_ema = 0.0
         self._tpot_pressure_ema = 0.0
@@ -100,6 +120,8 @@ class SloAwarePrefillController:
             ttft_pressure=self._ttft_pressure(now, waiting_queue, chunked_req),
             tpot_pressure=self._tpot_pressure(now, running_batch.reqs),
             has_decode_work=self._has_decode_work(running_batch.reqs),
+            prefill_cost_per_token_s=self._prefill_cost_per_token_s,
+            decode_cost_s=self._decode_cost_s,
         )
 
     def make_decision_from_pressure_state(
@@ -113,6 +135,10 @@ class SloAwarePrefillController:
         ttft_pressure = pressure_state.ttft_pressure
         tpot_pressure = pressure_state.tpot_pressure
         has_decode_work = pressure_state.has_decode_work
+        self._active_prefill_cost_per_token_s = (
+            pressure_state.prefill_cost_per_token_s or self._prefill_cost_per_token_s
+        )
+        self._active_decode_cost_s = pressure_state.decode_cost_s or self._decode_cost_s
         smoothed_ttft_pressure, smoothed_tpot_pressure = self._update_pressure(
             ttft_pressure, tpot_pressure
         )
@@ -137,7 +163,7 @@ class SloAwarePrefillController:
 
         if objective == "tpot" and has_decode_work:
             max_prefill_requests = 1
-            if ttft_pressure < self.hard_yield_ttft_pressure:
+            if self._can_yield_to_decode(ttft_pressure):
                 allow_prefill = False
                 yield_prefill_to_decode = True
 
@@ -157,7 +183,29 @@ class SloAwarePrefillController:
             smoothed_tpot_pressure=smoothed_tpot_pressure,
             has_decode_work=has_decode_work,
             yield_prefill_to_decode=yield_prefill_to_decode,
+            prefill_cost_per_token_s=self._active_prefill_cost_per_token_s,
+            decode_cost_s=self._active_decode_cost_s,
         )
+
+    def observe_batch_cost(
+        self, *, prefill_tokens: int, decode_tokens: int, elapsed_s: float
+    ) -> None:
+        if elapsed_s <= 0.0:
+            return
+        if prefill_tokens > 0:
+            effective_elapsed = elapsed_s
+            if decode_tokens > 0 and self._has_decode_cost_sample:
+                effective_elapsed = max(elapsed_s - self._decode_cost_s, elapsed_s * 0.25)
+            sample = effective_elapsed / max(prefill_tokens, 1)
+            self._prefill_cost_per_token_s = self._ema_cost(
+                self._prefill_cost_per_token_s, sample, self._has_prefill_cost_sample
+            )
+            self._has_prefill_cost_sample = True
+        elif decode_tokens > 0:
+            self._decode_cost_s = self._ema_cost(
+                self._decode_cost_s, elapsed_s, self._has_decode_cost_sample
+            )
+            self._has_decode_cost_sample = True
 
     def prioritize_waiting_queue(self, waiting_queue: list["Req"]) -> None:
         if not self.prefill_priority_boost or len(waiting_queue) <= 1:
@@ -221,31 +269,75 @@ class SloAwarePrefillController:
         has_decode_work: bool,
     ) -> int:
         if not has_decode_work:
-            scale = 1.0
-        elif objective == "tpot":
-            if ttft_pressure < self.hard_yield_ttft_pressure:
-                scale = 0.0
-            elif ttft_pressure < 1.0:
-                scale = 0.25
-            elif ttft_pressure < 2.0:
-                scale = 0.5
-            else:
-                scale = 0.75
-        elif tpot_pressure >= 1.5 and ttft_pressure < tpot_pressure:
-            scale = 0.25
-        elif tpot_pressure >= 1.0:
-            scale = 0.5
-        elif tpot_pressure >= 0.85:
-            scale = 0.75
-        elif ttft_pressure >= 1.0:
-            scale = 1.0
-        else:
-            scale = 0.75
+            return self._floor_to_unit(base_chunk)
 
-        chunk = int(base_chunk * scale)
+        if objective == "ttft":
+            chunk = self._ttft_objective_token_budget(
+                base_chunk, ttft_pressure, tpot_pressure
+            )
+        else:
+            chunk = self._tpot_objective_token_budget(base_chunk, ttft_pressure)
+
         chunk = max(self.min_chunk_size, chunk)
         chunk = min(base_chunk, chunk, self.max_prefill_tokens)
         return self._floor_to_unit(chunk)
+
+    def _ttft_objective_token_budget(
+        self, base_chunk: int, ttft_pressure: float, tpot_pressure: float
+    ) -> int:
+        if self.tpot_slo_s <= 0.0:
+            return base_chunk
+        if tpot_pressure >= 1.0 and ttft_pressure < tpot_pressure:
+            return self.min_chunk_size
+
+        if ttft_pressure >= 1.0 and tpot_pressure <= 0.5:
+            return base_chunk
+
+        tpot_slack_s = max((1.0 - tpot_pressure) * self.tpot_slo_s, 0.0)
+        token_budget = self._prefill_tokens_for_latency(tpot_slack_s)
+        if ttft_pressure >= 1.0:
+            token_budget = max(token_budget, base_chunk // 2)
+        return max(self.min_chunk_size, min(base_chunk, token_budget))
+
+    def _tpot_objective_token_budget(self, base_chunk: int, ttft_pressure: float) -> int:
+        if ttft_pressure >= 2.0:
+            return int(base_chunk * 0.75)
+        if ttft_pressure >= 1.0:
+            return int(base_chunk * 0.5)
+
+        if ttft_pressure >= self.hard_yield_ttft_pressure:
+            return int(base_chunk * 0.25)
+
+        ttft_slack_s = max((1.0 - ttft_pressure) * self.ttft_slo_s, 0.0)
+        min_prefill_cost_s = self._estimate_prefill_cost(self.min_chunk_size)
+        if ttft_slack_s <= self._active_decode_cost_s + min_prefill_cost_s:
+            return int(base_chunk * 0.25)
+        return self.min_chunk_size
+
+    def _can_yield_to_decode(self, ttft_pressure: float) -> bool:
+        if ttft_pressure >= 1.0:
+            return False
+        ttft_slack_s = max((1.0 - ttft_pressure) * self.ttft_slo_s, 0.0)
+        min_prefill_cost_s = self._estimate_prefill_cost(self.min_chunk_size)
+        return (
+            ttft_pressure < self.hard_yield_ttft_pressure
+            and ttft_slack_s > self._active_decode_cost_s + min_prefill_cost_s
+        )
+
+    def _prefill_tokens_for_latency(self, latency_s: float) -> int:
+        if latency_s <= 0.0:
+            return self.min_chunk_size
+        return int(latency_s / max(self._active_prefill_cost_per_token_s, 1e-9))
+
+    def _estimate_prefill_cost(self, tokens: int) -> float:
+        return max(tokens, 0) * max(self._active_prefill_cost_per_token_s, 1e-9)
+
+    def _ema_cost(self, old: float, sample: float, has_sample: bool) -> float:
+        sample = max(sample, 1e-9)
+        if not has_sample:
+            return sample
+        beta = 1.0 - self.cost_alpha
+        return beta * old + self.cost_alpha * sample
 
     def _floor_to_unit(self, value: int) -> int:
         unit = math.lcm(max(self.page_size, 1), max(self.tile_size, 1))
@@ -306,16 +398,40 @@ class SloAwarePrefillController:
         wait = now - entry if entry > 0.0 else 0.0
         if self._last_objective == "tpot":
             if not is_prefill:
-                tpot = self._request_tpot_pressure(now, req)
-                return (0, -tpot, entry)
+                predicted_tpot = self._request_predicted_tpot(now, req)
+                return (0, -predicted_tpot, entry)
             return (1, -wait, entry)
         remaining_input = max(req.seqlen - req.num_matched_prefix_tokens, 0)
-        predicted_ttft = wait + remaining_input / max(self.max_prefill_tokens, 1)
+        predicted_ttft = wait + self._estimate_prefill_cost(remaining_input)
         return (0 if is_prefill else 1, -predicted_ttft, entry)
 
-    def _request_tpot_pressure(self, now: float, req: "Req") -> float:
+    def _request_predicted_tpot(self, now: float, req: "Req") -> float:
+        output_len = max(len(req.output_ids), 1)
+        current_tpot_s = self._request_tpot_seconds(now, req)
+        remaining_output_len = self._predicted_remaining_output_len(req)
+        total_output_len = output_len + remaining_output_len
+        if total_output_len <= 0:
+            return current_tpot_s
+        return (
+            current_tpot_s * output_len
+            + self._active_decode_cost_s * remaining_output_len
+        ) / total_output_len
+
+    def _request_tpot_seconds(self, now: float, req: "Req") -> float:
         start = req.time_stats.prefill_finished_time
-        if start <= 0.0 or self.tpot_slo_s <= 0.0:
+        if start <= 0.0:
             return 0.0
         anchor = req.time_stats.last_decode_finish_time or start
-        return max(now - anchor, 0.0) / self.tpot_slo_s
+        gap = max(now - anchor, 0.0)
+        if req.time_stats.last_decode_finish_time > start and len(req.output_ids) > 1:
+            avg = (req.time_stats.last_decode_finish_time - start) / max(
+                len(req.output_ids) - 1, 1
+            )
+            return max(gap, avg)
+        return gap
+
+    def _predicted_remaining_output_len(self, req: "Req") -> int:
+        max_new_tokens = getattr(getattr(req, "sampling_params", None), "max_new_tokens", 0)
+        if max_new_tokens is None or max_new_tokens <= 0:
+            return max(1, len(req.output_ids))
+        return max(max_new_tokens - len(req.output_ids), 1)

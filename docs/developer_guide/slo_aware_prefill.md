@@ -209,9 +209,25 @@ margin = 0.10
 
 ## Workload 控制
 
+### Online Cost Model
+
+controller 维护轻量在线成本模型，对应 SOLA 论文中的 `Cp` / `Cd`：
+
+```text
+Cp ~= prefill_cost_per_token * prefill_tokens
+Cd ~= decode_cost_per_iteration
+```
+
+当前实现使用 EMA 更新：
+
+- 纯 prefill batch：用 prefill 日志间隔和 `#new-token` 更新 `prefill_cost_per_token`。
+- decode batch：用 decode 日志间隔除以 `decode_log_interval` 更新 `decode_cost_per_iteration`。
+- mixed prefill batch 暂不用于拟合 `Cp`，避免被中间 decode 间隔污染。
+- TP group 同步 pressure 时也同步 cost 标量，确保各 TP rank 使用同一组预测输入。
+
 ### Dynamic Chunk Size
 
-controller 根据 objective 和 pressure 动态缩放 `chunked_prefill_size`。
+controller 根据 SOLA Eq. 1 / Eq. 2 的约束思想动态缩放 `chunked_prefill_size`。
 
 简化规则：
 
@@ -219,27 +235,17 @@ controller 根据 objective 和 pressure 动态缩放 `chunked_prefill_size`。
 no active decode:
     chunk = base_chunk
 
-objective=tpot:
-    if ttft_pressure < hard_yield_ttft_pressure:
-        chunk = min_chunk
-    elif ttft_pressure < 1:
-        chunk = 0.25 * base_chunk
-    elif ttft_pressure < 2:
-        chunk = 0.5 * base_chunk
-    else:
-        chunk = 0.75 * base_chunk
-
 objective=ttft:
-    if tpot_pressure >= 1.5 and ttft_pressure < tpot_pressure:
-        chunk = 0.25 * base_chunk
-    elif tpot_pressure >= 1.0:
-        chunk = 0.5 * base_chunk
-    elif tpot_pressure >= 0.85:
-        chunk = 0.75 * base_chunk
-    elif ttft_pressure >= 1.0:
+    tpot_slack = (1 - tpot_pressure) * tpot_slo
+    chunk = floor_to_tile(tpot_slack / prefill_cost_per_token)
+    if TTFT has already violated and TPOT has large slack:
         chunk = base_chunk
+
+objective=tpot:
+    if TTFT has enough slack for one decode iteration + min prefill chunk:
+        yield_to_decode=True
     else:
-        chunk = 0.75 * base_chunk
+        chunk = the minimum prefill budget needed to keep TTFT moving
 ```
 
 最终 chunk 会被约束到：
@@ -474,9 +480,10 @@ prefill_max_requests=None
 | Request-level prioritization | waiting queue urgency sort |
 | State monitor | TTFT/TPOT pressure + EMA 日志 |
 | Constraint conversion | 根据 TTFT/TPOT pressure 切换 objective |
+| Cost model `Cp/Cd` | 已实现轻量在线 EMA 版本，用于 chunk/yield 约束 |
+| Constrained workload `ki/ni` | 已实现近似 Eq. 1 / Eq. 2 的 token budget 与 prefill cap |
 | Peak memory prediction | 尚未实现，依赖 SGLang 现有 allocator/admission |
-| Cost model `Cp/Cd` | 尚未实现，当前使用启发式 pressure/chunk 规则 |
-| Output length prediction | 尚未实现 |
+| Output length prediction | 已实现 request-level fallback：基于 `max_new_tokens - generated` |
 | Percentile-level relaxation | 尚未实现 |
 
 ## 已知限制
@@ -484,12 +491,13 @@ prefill_max_requests=None
 1. **不是完整 constrained optimization**
    - 当前不是求解 Eq. 1 / Eq. 2，而是启发式近似。
 
-2. **缺少在线 cost model**
-   - 当前 `Cp` / `Cd` 没有根据真实 forward latency 动态拟合。
-   - chunk size 只按 pressure 缩放，不能精确预测一个 prefill chunk 对 TPOT 的影响。
+2. **在线 cost model 仍是低维近似**
+   - 当前不是完整多项式拟合，只估计 prefill token 单价和 decode iteration 单价。
+   - mixed batch 暂不用于拟合 `Cp`，避免异步调度间隔污染。
 
-3. **缺少 output length prediction**
-   - request-level decode priority 没有完整估计 remaining output length。
+3. **output length prediction 仍是 fallback**
+   - 当前使用 `max_new_tokens - generated` 估计 remaining output length。
+   - 尚未按输入长度 / max output length 分桶统计真实输出长度分布。
 
 4. **缺少 peak memory prediction**
    - 高并发下 memory 边界仍主要依赖 SGLang 原有 admission 和 allocator。
@@ -512,26 +520,27 @@ prefill_max_requests=None
 
 ### Phase 2：在线 Cost Model
 
-实现轻量在线模型：
+当前已实现轻量在线 EMA 模型，后续可升级为论文中的多项式模型：
 
 ```text
 Cp ~= a0 * sum(l_has * l_in) + b0 * sum(l_in^2) + c0 * sum(l_in) + d0
 Cd ~= a1 * batch_size + b1 * sum(kv_len) + c1
 ```
 
-输入来自每轮实际 forward batch：
+输入来自 scheduler metrics 中已统计的 prefill/decode 迭代间隔。后续升级项：
 
-- prefill token 数；
-- prefix/KV 长度；
-- decode batch size；
-- forward latency。
+- 引入 prefix/KV 长度特征；
+- 区分 batch size、chunk size、MoE routing 等特征；
+- 使用 device timer 替代 wall-clock log interval。
 
 ### Phase 3：Constrained Workload
 
-基于 cost model 近似 SOLA Eq. 1 / Eq. 2：
+当前已基于 cost model 近似 SOLA Eq. 1 / Eq. 2：
 
-- `objective=ttft`：计算最大可接受 prefill token budget `ki`，约束 TPOT。
-- `objective=tpot`：计算最小需要加入的 prefill 请求数 `ni`，约束 TTFT。
+- `objective=ttft`：用 TPOT slack 计算最大可接受 prefill token budget `ki`。
+- `objective=tpot`：用 TTFT slack 判断是否 yield decode，或保留最小 prefill budget 防止 TTFT 饿死。
+
+后续可进一步做 request-level exact solver，而不是当前的 closed-form budget。
 
 ### Phase 4：Peak Memory Prediction
 
