@@ -153,7 +153,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         decision = controller.make_decision(
-            waiting_queue=[FakeReq(wait_s=0.6)],
+            waiting_queue=[FakeReq(wait_s=0.9)],
             running_batch=running,
             chunked_req=None,
             default_chunked_prefill_size=1024,
@@ -161,7 +161,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertTrue(decision.allow_prefill)
-        self.assertEqual(decision.chunked_prefill_size, 256)
+        self.assertEqual(decision.chunked_prefill_size, 128)
         self.assertEqual(decision.max_prefill_requests, 1)
         self.assertTrue(decision.has_decode_work)
         self.assertFalse(decision.yield_prefill_to_decode)
@@ -226,6 +226,68 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertFalse(decision.allow_prefill)
         self.assertTrue(decision.yield_prefill_to_decode)
         self.assertEqual(decision.chunked_prefill_size, 128)
+
+    def test_tpot_objective_uses_profiled_prefill_budget_when_yield_is_unsafe(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=1000,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            tile_size=128,
+            min_chunk_size=None,
+            prefill_priority_boost=True,
+        )
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(128, 10.0), (1024, 100.0)],
+            decode_cost_ms=[(1, 170.0)],
+        )
+
+        decision = controller.make_decision_from_pressure_state(
+            pressure_state=SloAwarePrefillPressureState(
+                ttft_pressure=0.5,
+                tpot_pressure=0.7,
+                has_decode_work=True,
+                prefill_cost_per_token_s=controller._prefill_cost_per_token_s,
+                decode_cost_s=controller._decode_cost_for_batch(1),
+            ),
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "tpot")
+        self.assertTrue(decision.allow_prefill)
+        self.assertFalse(decision.yield_prefill_to_decode)
+        self.assertEqual(decision.chunked_prefill_size, 384)
+        self.assertEqual(decision.max_prefill_requests, 1)
+
+    def test_startup_cost_profile_drives_decode_yield(self):
+        controller = self.create_controller()
+        controller.yield_guard_ratio = 0.0
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(128, 10.0), (1024, 30.0)],
+            decode_cost_ms=[(1, 5.0), (4, 20.0)],
+        )
+
+        decision = controller.make_decision_from_pressure_state(
+            pressure_state=SloAwarePrefillPressureState(
+                ttft_pressure=0.6,
+                tpot_pressure=1.2,
+                has_decode_work=True,
+                prefill_cost_per_token_s=controller._prefill_cost_per_token_s,
+                decode_cost_s=controller._decode_cost_for_batch(4),
+            ),
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertEqual(decision.objective, "tpot")
+        self.assertEqual(decision.chunked_prefill_size, 128)
+        self.assertFalse(decision.allow_prefill)
+        self.assertTrue(decision.yield_prefill_to_decode)
+        self.assertAlmostEqual(decision.decode_cost_s, 0.02)
 
     def test_online_cost_model_expands_chunk_with_fast_prefill(self):
         controller = self.create_controller()
@@ -323,7 +385,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertTrue(decision.allow_prefill)
-        self.assertEqual(decision.chunked_prefill_size, 512)
+        self.assertEqual(decision.chunked_prefill_size, 1024)
         self.assertEqual(decision.max_prefill_requests, 1)
         self.assertTrue(decision.has_decode_work)
         self.assertFalse(decision.yield_prefill_to_decode)

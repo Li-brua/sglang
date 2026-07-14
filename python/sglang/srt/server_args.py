@@ -756,6 +756,26 @@ class ServerArgs:
         bool,
         "Disable online EMA cost updates for --enable-slo-aware-prefill and use the initial/default costs.",
     ] = False
+    disable_slo_prefill_startup_profiling: A[
+        bool,
+        "Disable startup forward profiling for SLO-aware prefill Cp/Cd cost tables.",
+    ] = False
+    slo_prefill_profile_prefill_step_size: A[
+        int,
+        "Token interval for startup SLO prefill Cp profiling up to chunked_prefill_size.",
+    ] = 2048
+    slo_prefill_profile_decode_context_len: A[
+        int,
+        "Synthetic context length per request for startup SLO decode Cd profiling.",
+    ] = 128
+    slo_prefill_profile_decode_batch_sizes: A[
+        Optional[List[int]],
+        "Explicit decode batch sizes for startup SLO Cd profiling. Defaults to captured decode cuda graph sizes.",
+    ] = None
+    slo_prefill_yield_guard_ratio: A[
+        float,
+        "Safety guard as a fraction of TTFT SLO for SLO-aware decode-yield slack checks.",
+    ] = 0.05
     slo_prefill_tile_size: A[
         int,
         "Tile multiple used when rounding SLO-aware dynamic prefill chunk sizes.",
@@ -6531,6 +6551,23 @@ class ServerArgs:
                 raise ValueError("--slo-prefill-initial-decode-cost-ms must be positive.")
             if self.slo_prefill_tile_size <= 0:
                 raise ValueError("--slo-prefill-tile-size must be positive.")
+            if self.slo_prefill_profile_prefill_step_size <= 0:
+                raise ValueError(
+                    "--slo-prefill-profile-prefill-step-size must be positive."
+                )
+            if self.slo_prefill_profile_decode_context_len <= 0:
+                raise ValueError(
+                    "--slo-prefill-profile-decode-context-len must be positive."
+                )
+            if self.slo_prefill_yield_guard_ratio < 0:
+                raise ValueError("--slo-prefill-yield-guard-ratio must be non-negative.")
+            if self.slo_prefill_profile_decode_batch_sizes is not None and any(
+                batch_size <= 0
+                for batch_size in self.slo_prefill_profile_decode_batch_sizes
+            ):
+                raise ValueError(
+                    "--slo-prefill-profile-decode-batch-sizes values must be positive."
+                )
             if (
                 self.slo_prefill_min_chunk_size is not None
                 and self.slo_prefill_min_chunk_size <= 0
