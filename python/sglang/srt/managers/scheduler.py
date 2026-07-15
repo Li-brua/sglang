@@ -1069,11 +1069,7 @@ class Scheduler(
                 base_chunked_prefill_size=self.chunked_prefill_size,
                 max_prefill_tokens=self.max_prefill_tokens,
                 page_size=self.page_size,
-                tile_size=self.server_args.slo_prefill_tile_size,
                 min_chunk_size=self.server_args.slo_prefill_min_chunk_size,
-                prefill_priority_boost=(
-                    not self.server_args.disable_slo_prefill_priority_boost
-                ),
                 ttft_stat=self.server_args.slo_prefill_ttft_stat,
                 tpot_stat=self.server_args.slo_prefill_tpot_stat,
                 initial_prefill_cost_ms_per_1k=(
@@ -1089,8 +1085,6 @@ class Scheduler(
                 cache_hit_io_cost_ratio=(
                     self.server_args.slo_prefill_cache_hit_io_cost_ratio
                 ),
-                enable_dp_attention=self.server_args.enable_dp_attention,
-                dp_size=self.server_args.dp_size,
             )
             logger.info(
                 "SLO-aware prefill enabled: "
@@ -1115,7 +1109,6 @@ class Scheduler(
                 f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
                 f"effective_min_chunk_size="
                 f"{self.slo_prefill_controller.min_chunk_size}, "
-                f"tile_size={self.server_args.slo_prefill_tile_size}, "
                 f"dp_attention={self.server_args.enable_dp_attention}, "
                 f"hicache={self.enable_hicache_storage}"
             )
@@ -3000,7 +2993,6 @@ class Scheduler(
                 return None, running_batch
             chunked_prefill_size = slo_prefill_decision.chunked_prefill_size
             prefill_max_requests = slo_prefill_decision.max_prefill_requests
-            self._prioritize_slo_prefill_waiting_queue()
 
         # Prefill policy
         adder = PrefillAdder(
@@ -3376,24 +3368,6 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
-    def _prioritize_slo_prefill_waiting_queue(self) -> None:
-        self.slo_prefill_controller.prioritize_waiting_queue(self.waiting_queue)
-        if not self.enable_hicache_storage or len(self.waiting_queue) <= 1:
-            return
-        self.waiting_queue.sort(key=self._slo_hicache_prefetch_sort_key)
-
-    def _slo_hicache_prefetch_sort_key(self, req: Req) -> int:
-        if len(req.output_ids) > 0:
-            return 0
-        try:
-            return 0 if self.tree_cache.check_prefetch_progress(req.rid) else 1
-        except Exception as exc:
-            logger.debug(
-                "Failed to check HiCache prefetch progress for SLO priority: %s",
-                exc,
-            )
-            return 0
-
     def _sync_slo_prefill_pressure_state(
         self, pressure_state: SloAwarePrefillPressureState
     ) -> SloAwarePrefillPressureState:
@@ -3472,7 +3446,8 @@ class Scheduler(
         decode_points: List[Tuple[int, int, float]] = []
         try:
             self._warmup_slo_profile_forward()
-            for num_tokens in self._slo_profile_prefill_sizes():
+            num_tokens = self._slo_profile_prefill_size()
+            if num_tokens > 0:
                 try:
                     cost_ms = self._profile_slo_prefill_cost(num_tokens)
                 except Exception as exc:
@@ -3482,8 +3457,8 @@ class Scheduler(
                         exc,
                         exc_info=logger.isEnabledFor(logging.DEBUG),
                     )
-                    continue
-                prefill_points.append((num_tokens, cost_ms))
+                else:
+                    prefill_points.append((num_tokens, cost_ms))
 
             for decode_context_len in self._slo_profile_decode_context_lens():
                 for batch_size in self._slo_profile_decode_batch_sizes(
@@ -3530,22 +3505,20 @@ class Scheduler(
         )
 
     def _warmup_slo_profile_forward(self) -> None:
-        sizes = self._slo_profile_prefill_sizes()
-        if not sizes:
+        size = self._slo_profile_prefill_size()
+        if size <= 0:
             return
         try:
-            self._profile_slo_prefill_cost(sizes[0])
+            self._profile_slo_prefill_cost(size)
         except Exception as exc:
             logger.debug("SLO prefill startup warmup failed: %s", exc, exc_info=True)
 
-    def _slo_profile_prefill_sizes(self) -> List[int]:
-        upper = self.chunked_prefill_size or self.max_prefill_tokens
-        upper = max(1, min(upper, self.max_prefill_tokens, self.max_req_input_len - 1))
-        step = self.server_args.slo_prefill_profile_prefill_step_size
-        sizes = list(range(step, upper + 1, step))
-        if not sizes or sizes[-1] != upper:
-            sizes.append(upper)
-        return sorted(set(size for size in sizes if size > 0))
+    def _slo_profile_prefill_size(self) -> int:
+        assert self.slo_prefill_controller is not None
+        upper = self.slo_prefill_controller.min_chunk_size
+        return max(
+            1, min(upper, self.max_prefill_tokens, self.max_req_input_len - 1)
+        )
 
     def _slo_profile_decode_context_lens_arg(self) -> List[int]:
         return self.server_args.slo_prefill_profile_decode_context_lens or [

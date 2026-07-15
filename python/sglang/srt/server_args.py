@@ -760,10 +760,6 @@ class ServerArgs:
         bool,
         "Disable startup forward profiling for SLO-aware prefill Cp/Cd cost tables.",
     ] = False
-    slo_prefill_profile_prefill_step_size: A[
-        int,
-        "Token interval for startup SLO prefill Cp profiling up to chunked_prefill_size.",
-    ] = 2048
     slo_prefill_profile_decode_context_len: A[
         int,
         "Synthetic context length per request for startup SLO decode Cd profiling when context length buckets are not specified.",
@@ -784,18 +780,10 @@ class ServerArgs:
         float,
         "IO cost multiplier for future cache-hit tokens in SLO TTFT future prefill cost estimation.",
     ] = 0.3
-    slo_prefill_tile_size: A[
-        int,
-        "Tile multiple used when rounding SLO-aware dynamic prefill chunk sizes.",
-    ] = 128
     slo_prefill_min_chunk_size: A[
         Optional[int],
-        "Minimum dynamic chunk size for --enable-slo-aware-prefill. Defaults to half of the effective chunked prefill size, rounded up and at least --slo-prefill-tile-size.",
+        "Minimum chunk size for --enable-slo-aware-prefill when TPOT pressure still requires a prefill step. Defaults to the effective chunked prefill size.",
     ] = None
-    disable_slo_prefill_priority_boost: A[
-        bool,
-        "Disable request urgency sorting in the SLO-aware prefill controller.",
-    ] = False
     schedule_policy: A[
         str,
         Arg(
@@ -6557,12 +6545,6 @@ class ServerArgs:
                 and self.slo_prefill_initial_decode_cost_ms <= 0
             ):
                 raise ValueError("--slo-prefill-initial-decode-cost-ms must be positive.")
-            if self.slo_prefill_tile_size <= 0:
-                raise ValueError("--slo-prefill-tile-size must be positive.")
-            if self.slo_prefill_profile_prefill_step_size <= 0:
-                raise ValueError(
-                    "--slo-prefill-profile-prefill-step-size must be positive."
-                )
             if self.slo_prefill_profile_decode_context_len <= 0:
                 raise ValueError(
                     "--slo-prefill-profile-decode-context-len must be positive."
