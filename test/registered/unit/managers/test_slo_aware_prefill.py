@@ -203,7 +203,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertTrue(decision.has_decode_work)
         self.assertFalse(decision.yield_prefill_to_decode)
 
-    def test_ttft_pressure_uses_wait_time_only(self):
+    def test_ttft_pressure_includes_future_prefill_cost(self):
         controller = self.create_controller()
         controller.set_startup_cost_profile(
             prefill_cost_ms=[(128, 100.0), (1024, 800.0)],
@@ -219,8 +219,53 @@ class TestSloAwarePrefillController(unittest.TestCase):
             default_prefill_max_requests=None,
         )
 
-        self.assertAlmostEqual(decision.ttft_pressure, 0.2, delta=0.05)
-        self.assertFalse(hasattr(decision, "ttft_remaining_prefill_cost_s"))
+        self.assertAlmostEqual(decision.ttft_pressure, 1.0, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.8, delta=0.05)
+        self.assertEqual(decision.ttft_future_miss_tokens, 1024)
+        self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.0)
+
+    def test_ttft_future_cost_uses_request_cache_hit_rate(self):
+        controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(512, 400.0), (1024, 800.0)],
+            decode_cost_ms=[(1, 10.0)],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024, matched=512)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_pressure, 0.6, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.4, delta=0.05)
+        self.assertEqual(decision.ttft_future_miss_tokens, 512)
+        self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.5)
+
+    def test_ttft_future_cost_uses_observed_cache_hit_rate(self):
+        controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(512, 400.0), (1024, 800.0)],
+            decode_cost_ms=[(1, 10.0)],
+        )
+        controller.observe_prefill_cache_hit(total_tokens=1024, cached_tokens=512)
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_pressure, 0.6, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.4, delta=0.05)
+        self.assertEqual(decision.ttft_future_miss_tokens, 512)
+        self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.5)
 
     def test_no_decode_uses_full_prefill_chunk(self):
         controller = self.create_controller()

@@ -2966,6 +2966,12 @@ class Scheduler(
                     f"{slo_prefill_decision.prefill_cost_per_token_s * 1e6:.3f}, "
                     f"decode_cost_ms={slo_prefill_decision.decode_cost_s * 1e3:.3f}, "
                     f"decode_context_len={slo_prefill_decision.decode_context_len}, "
+                    f"ttft_future_cost_ms="
+                    f"{slo_prefill_decision.ttft_future_prefill_cost_s * 1e3:.3f}, "
+                    f"ttft_future_miss_tokens="
+                    f"{slo_prefill_decision.ttft_future_miss_tokens}, "
+                    f"ttft_cache_hit_rate="
+                    f"{slo_prefill_decision.ttft_cache_hit_rate:.3f}, "
                     f"ttft_slack_ms={slo_prefill_decision.ttft_slack_s * 1e3:.3f}, "
                     f"yield_rhs_ms={slo_prefill_decision.yield_rhs_s * 1e3:.3f}, "
                     f"yield_guard_ms={slo_prefill_decision.yield_guard_s * 1e3:.3f}, "
@@ -3388,6 +3394,9 @@ class Scheduler(
                 pressure_state.prefill_cost_per_token_s,
                 pressure_state.decode_cost_s,
                 float(pressure_state.decode_context_len),
+                pressure_state.ttft_future_prefill_cost_s,
+                float(pressure_state.ttft_future_miss_tokens),
+                pressure_state.ttft_cache_hit_rate,
             ],
             dtype=torch.float32,
         )
@@ -3413,6 +3422,9 @@ class Scheduler(
             prefill_cost_per_token_s=float(pressure_tensor[3].item()),
             decode_cost_s=float(pressure_tensor[4].item()),
             decode_context_len=int(pressure_tensor[5].item()),
+            ttft_future_prefill_cost_s=float(pressure_tensor[6].item()),
+            ttft_future_miss_tokens=int(pressure_tensor[7].item()),
+            ttft_cache_hit_rate=float(pressure_tensor[8].item()),
         )
 
     def _profile_slo_prefill_costs(self) -> None:

@@ -56,17 +56,20 @@ sglang serve \
 每轮 prefill admission 前，scheduler 会计算并同步一个 `SloAwarePrefillPressureState`：
 
 ```text
-(ttft_pressure, tpot_pressure, has_decode_work, prefill_cost, decode_cost, decode_context_len)
+(ttft_pressure, tpot_pressure, has_decode_work, prefill_cost, decode_cost, decode_context_len, ttft_future_prefill_cost, ttft_future_miss_tokens, ttft_cache_hit_rate)
 ```
 
 ### TTFT Pressure
 
 ```text
-per_req_ttft_pressure = prefill_wait_time / ttft_slo
+cache_hit_rate = max(request_known_hit_rate, observed_cache_hit_rate_ema)
+future_miss_tokens = clamp(total_prompt_tokens * (1 - cache_hit_rate) - already_computed_miss_tokens, 0, remaining_tokens)
+future_prefill_cost = Cp(future_miss_tokens)
+per_req_ttft_pressure = (prefill_wait_time + future_prefill_cost) / ttft_slo
 ttft_pressure = aggregate(per_req_ttft_pressure, stat=max|mean|p90)
 ```
 
-waiting queue 中尚未 prefill 的请求以及正在 chunked prefill 的请求都会参与统计。当前 TTFT pressure 只看已经等待的时间，不再把预计剩余 prefill cost 加进去，避免长 prompt 或 HiCache/offload 场景下因成本高估过早关闭 decode yield。
+waiting queue 中尚未 prefill 的请求以及正在 chunked prefill 的请求都会参与统计。TTFT pressure 会把未来仍可能需要实际计算的 prefill miss tokens 计入压力，但会用请求已知 prefix/HiCache 命中率和在线观测到的 cache hit EMA 进行折扣，避免长 prompt 或 KV offload 场景下把全部剩余 token 都当成未命中计算。
 
 ### TPOT Pressure
 
@@ -302,7 +305,7 @@ SLO prefill startup cost profile: Cp(ms)=[...], Cd(ms)=[...]
 运行时关键日志：
 
 ```text
-SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=..., chunk=..., prefill_max_requests=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=..., decode_context_len=..., ttft_slack_ms=..., yield_rhs_ms=..., yield_guard_ms=..., min_prefill_cost_ms=..., waiting=..., running=...
+SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=..., chunk=..., prefill_max_requests=..., ttft_pressure=..., tpot_pressure=..., prefill_cost_ms_per_1k=..., decode_cost_ms=..., decode_context_len=..., ttft_future_cost_ms=..., ttft_future_miss_tokens=..., ttft_cache_hit_rate=..., ttft_slack_ms=..., yield_rhs_ms=..., yield_guard_ms=..., min_prefill_cost_ms=..., waiting=..., running=...
 ```
 
 其中：
@@ -312,6 +315,9 @@ SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=
 - `prefill_cost_ms_per_1k` 是当前低维 fallback cost；真实 chunk 预算优先使用启动 Cp 表。
 - `decode_cost_ms` 是按当前 decode batch size 和 `decode_context_len` 估计/同步后的 Cd。
 - `decode_context_len` 是当前 running decode 请求的最大 `seqlen`，DP/TP 同步后取最大值。
+- `ttft_future_cost_ms` 是当前 TTFT pressure 中计入的未来 prefill miss 成本。
+- `ttft_future_miss_tokens` 是按请求命中率与在线 cache hit EMA 折扣后的未来 miss token 数。
+- `ttft_cache_hit_rate` 是本轮 TTFT 估计使用的有效 cache hit rate。
 - `ttft_slack_ms` 与 `yield_rhs_ms` 分别是 yield 公式左右两边，便于判断为什么本轮让 decode 插队或继续 prefill。
 
 ## 已知限制
@@ -319,7 +325,7 @@ SLO prefill decision: objective=..., allow=..., yield_to_decode=..., has_decode=
 - 当前仍是状态机 + closed-form budget，不是完整 SOLA constrained solver。
 - 启动 profiling 暂不覆盖 speculative decoding / PP / disaggregation。
 - `chunked_prefill_size` 仍是静态上限；后续可改为基于当前 KV/token pool 峰值预测动态求 `memory_cap_chunk`。
-- `Cp/Cd` 表已覆盖 prefill token 数、decode batch size 和 decode KV 长度桶；尚未区分 prefix cache hit、MoE routing、batch 内序列长度分布等特征。
+- `Cp/Cd` 表已覆盖 prefill token 数、decode batch size 和 decode KV 长度桶；TTFT future cost 会用 cache hit EMA 做近似折扣，但尚未区分 MoE routing、batch 内序列长度分布等特征。
 - Percentile SLO 目前通过 pressure 聚合口径近似，没有实现完整 percentile-level relaxation。
 
 ## 验证

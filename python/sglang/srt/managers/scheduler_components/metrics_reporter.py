@@ -542,15 +542,14 @@ class SchedulerMetricsReporter:
         self.last_input_throughput = (
             prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
-        if (
-            self.scheduler.slo_prefill_controller is not None
-            and prefill_stats.num_running_reqs.total == 0
-        ):
-            self.scheduler.slo_prefill_controller.observe_batch_cost(
-                prefill_tokens=prefill_stats.log_input_tokens,
-                decode_tokens=0,
-                elapsed_s=gap_latency,
-            )
+        if self.scheduler.slo_prefill_controller is not None:
+            self._observe_slo_prefill_cache_hit(batch)
+            if prefill_stats.num_running_reqs.total == 0:
+                self.scheduler.slo_prefill_controller.observe_batch_cost(
+                    prefill_tokens=prefill_stats.log_input_tokens,
+                    decode_tokens=0,
+                    elapsed_s=gap_latency,
+                )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
@@ -686,6 +685,39 @@ class SchedulerMetricsReporter:
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
+
+    def _observe_slo_prefill_cache_hit(self, batch: Optional[ScheduleBatch]) -> None:
+        if batch is None:
+            return
+        total_tokens = 0
+        cached_tokens = 0
+        for req in batch.reqs:
+            if getattr(req, "_slo_cache_hit_observed", False):
+                continue
+            if getattr(req, "extend_range", None) is None:
+                continue
+            origin_ids = getattr(req, "origin_input_ids", None)
+            req_total_tokens = len(origin_ids) if origin_ids is not None else 0
+            if req_total_tokens <= 0:
+                continue
+            req_cached_tokens = max(getattr(req, "cached_tokens", 0), 0)
+            req_cached_tokens = max(
+                req_cached_tokens,
+                max(getattr(req, "cached_tokens_device", 0), 0)
+                + max(getattr(req, "cached_tokens_host", 0), 0)
+                + max(getattr(req, "cached_tokens_storage", 0), 0),
+                max(getattr(req, "num_matched_prefix_tokens", 0), 0),
+            )
+            prefix_indices = getattr(req, "prefix_indices", None)
+            if prefix_indices is not None:
+                req_cached_tokens = max(req_cached_tokens, len(prefix_indices))
+            total_tokens += req_total_tokens
+            cached_tokens += min(req_cached_tokens, req_total_tokens)
+            setattr(req, "_slo_cache_hit_observed", True)
+        if total_tokens > 0:
+            self.scheduler.slo_prefill_controller.observe_prefill_cache_hit(
+                total_tokens=total_tokens, cached_tokens=cached_tokens
+            )
 
     def report_decode_stats(
         self,

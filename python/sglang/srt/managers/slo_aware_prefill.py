@@ -25,6 +25,9 @@ class SloAwarePrefillDecision:
     prefill_cost_per_token_s: float
     decode_cost_s: float
     decode_context_len: int
+    ttft_future_prefill_cost_s: float
+    ttft_future_miss_tokens: int
+    ttft_cache_hit_rate: float
     ttft_slack_s: float
     yield_rhs_s: float
     yield_guard_s: float
@@ -41,6 +44,9 @@ class SloAwarePrefillPressureState:
     prefill_cost_per_token_s: float = 0.0
     decode_cost_s: float = 0.0
     decode_context_len: int = 0
+    ttft_future_prefill_cost_s: float = 0.0
+    ttft_future_miss_tokens: int = 0
+    ttft_cache_hit_rate: float = 0.0
 
 
 class SloAwarePrefillController:
@@ -87,6 +93,7 @@ class SloAwarePrefillController:
         self.tpot_stat = self._normalize_pressure_stat(tpot_stat)
         self.pressure_alpha = 0.25
         self.cost_alpha = 0.20
+        self.cache_hit_alpha = 0.20
         self.objective_margin = 0.10
         self.yield_guard_ratio = max(yield_guard_ratio, 0.0)
         self.hard_prefill_ttft_pressure = 1.50
@@ -115,6 +122,8 @@ class SloAwarePrefillController:
         self._active_decode_cost_s = self._decode_cost_s
         self._has_prefill_cost_sample = False
         self._has_decode_cost_sample = False
+        self._has_cache_hit_sample = False
+        self._cache_hit_rate = 0.0
         self._has_pressure_sample = False
         self._ttft_pressure_ema = 0.0
         self._tpot_pressure_ema = 0.0
@@ -169,8 +178,14 @@ class SloAwarePrefillController:
         now = time.perf_counter()
         decode_reqs = self._decode_reqs(running_batch.reqs)
         decode_context_len = self._decode_context_len(decode_reqs)
+        (
+            ttft_pressure,
+            ttft_future_prefill_cost_s,
+            ttft_future_miss_tokens,
+            ttft_cache_hit_rate,
+        ) = self._ttft_pressure(now, waiting_queue, chunked_req)
         return SloAwarePrefillPressureState(
-            ttft_pressure=self._ttft_pressure(now, waiting_queue, chunked_req),
+            ttft_pressure=ttft_pressure,
             tpot_pressure=self._tpot_pressure(now, decode_reqs),
             has_decode_work=len(decode_reqs) > 0,
             prefill_cost_per_token_s=self._prefill_cost_per_token_s,
@@ -178,6 +193,9 @@ class SloAwarePrefillController:
                 len(decode_reqs), decode_context_len
             ),
             decode_context_len=decode_context_len,
+            ttft_future_prefill_cost_s=ttft_future_prefill_cost_s,
+            ttft_future_miss_tokens=ttft_future_miss_tokens,
+            ttft_cache_hit_rate=ttft_cache_hit_rate,
         )
 
     def make_decision_from_pressure_state(
@@ -249,6 +267,9 @@ class SloAwarePrefillController:
             prefill_cost_per_token_s=self._active_prefill_cost_per_token_s,
             decode_cost_s=self._active_decode_cost_s,
             decode_context_len=pressure_state.decode_context_len,
+            ttft_future_prefill_cost_s=pressure_state.ttft_future_prefill_cost_s,
+            ttft_future_miss_tokens=pressure_state.ttft_future_miss_tokens,
+            ttft_cache_hit_rate=pressure_state.ttft_cache_hit_rate,
             ttft_slack_s=ttft_slack_s,
             yield_rhs_s=yield_rhs_s,
             yield_guard_s=yield_guard_s,
@@ -298,7 +319,9 @@ class SloAwarePrefillController:
         if prefill_tokens > 0:
             effective_elapsed = elapsed_s
             if decode_tokens > 0 and self._has_decode_cost_sample:
-                effective_elapsed = max(elapsed_s - self._decode_cost_s, elapsed_s * 0.25)
+                effective_elapsed = max(
+                    elapsed_s - self._decode_cost_s, elapsed_s * 0.25
+                )
             sample = effective_elapsed / max(prefill_tokens, 1)
             self._prefill_cost_per_token_s = self._ema_cost(
                 self._prefill_cost_per_token_s, sample, self._has_prefill_cost_sample
@@ -309,6 +332,21 @@ class SloAwarePrefillController:
                 self._decode_cost_s, elapsed_s, self._has_decode_cost_sample
             )
             self._has_decode_cost_sample = True
+
+    def observe_prefill_cache_hit(
+        self, *, total_tokens: int, cached_tokens: int
+    ) -> None:
+        if total_tokens <= 0:
+            return
+        sample = min(max(cached_tokens / total_tokens, 0.0), 1.0)
+        if not self._has_cache_hit_sample:
+            self._cache_hit_rate = sample
+            self._has_cache_hit_sample = True
+            return
+        beta = 1.0 - self.cache_hit_alpha
+        self._cache_hit_rate = (
+            beta * self._cache_hit_rate + self.cache_hit_alpha * sample
+        )
 
     def prioritize_waiting_queue(self, waiting_queue: list["Req"]) -> None:
         if not self.prefill_priority_boost or len(waiting_queue) <= 1:
@@ -630,18 +668,103 @@ class SloAwarePrefillController:
 
     def _ttft_pressure(
         self, now: float, waiting_queue: Sequence["Req"], chunked_req: Optional["Req"]
-    ) -> float:
+    ) -> tuple[float, float, int, float]:
         if self.ttft_slo_s <= 0:
-            return 0.0
+            return 0.0, 0.0, 0, 0.0
         pressures = []
+        future_costs_s = []
+        future_miss_tokens = []
+        cache_hit_rates = []
         for req in self._prefill_candidates(waiting_queue, chunked_req):
             entry = (
                 req.time_stats.wait_queue_entry_time
                 or req.time_stats.scheduler_recv_time
             )
-            if entry > 0.0:
-                pressures.append((now - entry) / self.ttft_slo_s)
-        return self._aggregate_pressure(pressures, self.ttft_stat)
+            if entry <= 0.0:
+                continue
+            future_cost_s, miss_tokens, cache_hit_rate = (
+                self._estimate_future_prefill_cost(req)
+            )
+            future_costs_s.append(future_cost_s)
+            future_miss_tokens.append(float(miss_tokens))
+            cache_hit_rates.append(cache_hit_rate)
+            pressures.append((now - entry + future_cost_s) / self.ttft_slo_s)
+        return (
+            self._aggregate_pressure(pressures, self.ttft_stat),
+            self._aggregate_pressure(future_costs_s, self.ttft_stat),
+            int(self._aggregate_pressure(future_miss_tokens, self.ttft_stat)),
+            self._aggregate_pressure(cache_hit_rates, self.ttft_stat),
+        )
+
+    def _estimate_future_prefill_cost(self, req: "Req") -> tuple[float, int, float]:
+        future_miss_tokens, cache_hit_rate = self._estimate_future_miss_tokens(req)
+        return (
+            self._estimate_prefill_cost(future_miss_tokens),
+            future_miss_tokens,
+            cache_hit_rate,
+        )
+
+    def _estimate_future_miss_tokens(self, req: "Req") -> tuple[int, float]:
+        total_tokens = self._total_prefill_tokens(req)
+        if total_tokens <= 0:
+            return 0, 0.0
+
+        processed_tokens = min(self._processed_prefill_tokens(req), total_tokens)
+        remaining_tokens = max(total_tokens - processed_tokens, 0)
+        if remaining_tokens <= 0:
+            return 0, 1.0
+
+        known_cached_tokens = min(self._known_cached_tokens(req), total_tokens)
+        request_hit_rate = known_cached_tokens / max(total_tokens, 1)
+        cache_hit_rate = request_hit_rate
+        if self._has_cache_hit_sample:
+            cache_hit_rate = max(cache_hit_rate, self._cache_hit_rate)
+        cache_hit_rate = min(max(cache_hit_rate, 0.0), 1.0)
+
+        estimated_total_miss_tokens = math.ceil(total_tokens * (1.0 - cache_hit_rate))
+        already_computed_miss_tokens = max(processed_tokens - known_cached_tokens, 0)
+        future_miss_tokens = max(
+            estimated_total_miss_tokens - already_computed_miss_tokens, 0
+        )
+        return min(future_miss_tokens, remaining_tokens), cache_hit_rate
+
+    def _total_prefill_tokens(self, req: "Req") -> int:
+        full_ids = getattr(req, "full_untruncated_fill_ids", None)
+        if full_ids is not None and len(full_ids) > 0:
+            return len(full_ids)
+        origin_ids = getattr(req, "origin_input_ids", None)
+        if origin_ids is not None:
+            return len(origin_ids)
+        return max(getattr(req, "seqlen", 0), 0)
+
+    def _processed_prefill_tokens(self, req: "Req") -> int:
+        processed_tokens = max(getattr(req, "num_matched_prefix_tokens", 0), 0)
+        prefix_indices = getattr(req, "prefix_indices", None)
+        if prefix_indices is not None:
+            processed_tokens = max(processed_tokens, len(prefix_indices))
+        extend_range = getattr(req, "extend_range", None)
+        if extend_range is not None:
+            processed_tokens = max(processed_tokens, extend_range.end)
+        processed_tokens = max(processed_tokens, getattr(req, "already_computed", 0))
+        return processed_tokens
+
+    def _known_cached_tokens(self, req: "Req") -> int:
+        cached_tokens = max(getattr(req, "cached_tokens", 0), 0)
+        detailed_cached_tokens = (
+            max(getattr(req, "cached_tokens_device", 0), 0)
+            + max(getattr(req, "cached_tokens_host", 0), 0)
+            + max(getattr(req, "cached_tokens_storage", 0), 0)
+        )
+        cached_tokens = max(cached_tokens, detailed_cached_tokens)
+        cached_tokens = max(
+            cached_tokens, getattr(req, "num_matched_prefix_tokens", 0)
+        )
+        prefix_indices = getattr(req, "prefix_indices", None)
+        if prefix_indices is not None:
+            cached_tokens = max(cached_tokens, len(prefix_indices))
+        host_hit_length = max(getattr(req, "host_hit_length", 0), 0)
+        storage_hit_length = max(getattr(req, "storage_hit_length", 0), 0)
+        return max(cached_tokens, host_hit_length, storage_hit_length)
 
     def _tpot_pressure(self, now: float, running_reqs: Iterable["Req"]) -> float:
         if self.tpot_slo_s <= 0:
@@ -692,8 +815,7 @@ class SloAwarePrefillController:
                 predicted_tpot = self._request_predicted_tpot(now, req)
                 return (0, -predicted_tpot, entry)
             return (1, -wait, entry)
-        remaining_input = max(req.seqlen - req.num_matched_prefix_tokens, 0)
-        predicted_ttft = wait + self._estimate_prefill_cost(remaining_input)
+        predicted_ttft = wait + self._estimate_future_prefill_cost(req)[0]
         return (0 if is_prefill else 1, -predicted_ttft, entry)
 
     def _request_predicted_tpot(self, now: float, req: "Req") -> float:
