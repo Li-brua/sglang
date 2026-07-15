@@ -780,6 +780,10 @@ class ServerArgs:
         float,
         "Safety guard as a fraction of TTFT SLO for SLO-aware decode-yield slack checks.",
     ] = 0.05
+    slo_prefill_cache_hit_io_cost_ratio: A[
+        float,
+        "IO cost multiplier for future cache-hit tokens in SLO TTFT future prefill cost estimation.",
+    ] = 0.3
     slo_prefill_tile_size: A[
         int,
         "Tile multiple used when rounding SLO-aware dynamic prefill chunk sizes.",
@@ -6572,6 +6576,10 @@ class ServerArgs:
                 )
             if self.slo_prefill_yield_guard_ratio < 0:
                 raise ValueError("--slo-prefill-yield-guard-ratio must be non-negative.")
+            if self.slo_prefill_cache_hit_io_cost_ratio < 0:
+                raise ValueError(
+                    "--slo-prefill-cache-hit-io-cost-ratio must be non-negative."
+                )
             if self.slo_prefill_profile_decode_batch_sizes is not None and any(
                 batch_size <= 0
                 for batch_size in self.slo_prefill_profile_decode_batch_sizes

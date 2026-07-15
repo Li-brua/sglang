@@ -26,6 +26,7 @@ class FakeReq:
         output_len=0,
         seqlen=128,
         matched=0,
+        cached=0,
     ):
         now = time.perf_counter()
         self.time_stats = SimpleNamespace(
@@ -41,6 +42,7 @@ class FakeReq:
         self.output_ids = [0] * output_len
         self.seqlen = seqlen
         self.num_matched_prefix_tokens = matched
+        self.cached_tokens = cached
         self.is_retracted = False
 
     def finished(self):
@@ -222,6 +224,8 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertAlmostEqual(decision.ttft_pressure, 1.0, delta=0.05)
         self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.8, delta=0.05)
         self.assertEqual(decision.ttft_future_miss_tokens, 1024)
+        self.assertEqual(decision.ttft_future_hit_tokens, 0)
+        self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.0)
         self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.0)
 
     def test_ttft_future_cost_uses_request_cache_hit_rate(self):
@@ -233,16 +237,18 @@ class TestSloAwarePrefillController(unittest.TestCase):
         running = SimpleNamespace(reqs=[])
 
         decision = controller.make_decision(
-            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024, matched=512)],
+            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024, cached=512)],
             running_batch=running,
             chunked_req=None,
             default_chunked_prefill_size=1024,
             default_prefill_max_requests=None,
         )
 
-        self.assertAlmostEqual(decision.ttft_pressure, 0.6, delta=0.05)
-        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.4, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_pressure, 0.72, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.52, delta=0.05)
         self.assertEqual(decision.ttft_future_miss_tokens, 512)
+        self.assertEqual(decision.ttft_future_hit_tokens, 512)
+        self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.12, delta=0.05)
         self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.5)
 
     def test_ttft_future_cost_uses_observed_cache_hit_rate(self):
@@ -262,10 +268,44 @@ class TestSloAwarePrefillController(unittest.TestCase):
             default_prefill_max_requests=None,
         )
 
+        self.assertAlmostEqual(decision.ttft_pressure, 0.72, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.52, delta=0.05)
+        self.assertEqual(decision.ttft_future_miss_tokens, 512)
+        self.assertEqual(decision.ttft_future_hit_tokens, 512)
+        self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.12, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.5)
+
+    def test_ttft_future_cost_can_disable_cache_hit_io_cost(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            tile_size=128,
+            min_chunk_size=None,
+            prefill_priority_boost=True,
+            cache_hit_io_cost_ratio=0.0,
+        )
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(512, 400.0), (1024, 800.0)],
+            decode_cost_ms=[(1, 10.0)],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024, cached=512)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
         self.assertAlmostEqual(decision.ttft_pressure, 0.6, delta=0.05)
         self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.4, delta=0.05)
         self.assertEqual(decision.ttft_future_miss_tokens, 512)
-        self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.5)
+        self.assertEqual(decision.ttft_future_hit_tokens, 512)
+        self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.0)
 
     def test_no_decode_uses_full_prefill_chunk(self):
         controller = self.create_controller()
