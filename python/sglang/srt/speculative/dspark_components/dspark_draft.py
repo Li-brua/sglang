@@ -436,6 +436,11 @@ class DraftBlockProposer:
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
+        # The draft CUDA graph is keyed by the DP-global request count, while
+        # global_num_tokens_cpu below is scaled to the speculative token width.
+        # ForwardBatch.init_new preserves both views for regular scheduler
+        # batches; this manually constructed draft batch must do the same.
+        forward_batch.original_global_num_tokens_cpu = list(batch.global_num_tokens)
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(

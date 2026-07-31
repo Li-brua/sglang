@@ -3912,7 +3912,12 @@ class Scheduler(
             else:
                 committed = int(batch.seq_lens[i].item())
             req.kv_committed_len = committed
-            req.kv_allocated_len = max(req.kv_allocated_len, committed)
+            if req.kv is None:
+                raise RuntimeError(
+                    f"SLO profile request {req.rid} has no allocated KV state "
+                    "after prefill."
+                )
+            req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, committed)
         if not batch.spec_algorithm.is_none():
             batch.spec_info = result.next_draft_input
         if result.new_seq_lens is not None:
@@ -4062,7 +4067,10 @@ class Scheduler(
 
         req_pool_idx = req.req_pool_idx
         try:
-            kv_len = max(req.kv_allocated_len, req.kv_committed_len, 0)
+            kv_allocated_len = (
+                req.kv.kv_allocated_len if req.kv is not None else 0
+            )
+            kv_len = max(kv_allocated_len, req.kv_committed_len, 0)
             if kv_len > 0:
                 kv_indices = self.req_to_token_pool.req_to_token[
                     req_pool_idx, :kv_len
@@ -4090,7 +4098,7 @@ class Scheduler(
                         exc,
                         exc_info=True,
                     )
-            req.kv_allocated_len = 0
+            req.kv = None
             req.kv_committed_len = 0
             req.kv_committed_freed = True
             req.kv_overallocated_freed = True
