@@ -71,7 +71,8 @@ class SloAwarePrefillController:
         initial_prefill_cost_ms_per_1k: Optional[float] = None,
         initial_decode_cost_ms: Optional[float] = None,
         yield_guard_ratio: float = 0.05,
-        cache_hit_io_cost_ratio: float = 0.3,
+        cache_hit_io_cost_ratio: float = 0.0,
+        enable_cache_hit_io_cost: bool = True,
     ) -> None:
         self.ttft_slo_s = ttft_slo_ms / 1000.0
         self.tpot_slo_s = tpot_slo_ms / 1000.0
@@ -87,6 +88,7 @@ class SloAwarePrefillController:
         self.objective_margin = 0.10
         self.yield_guard_ratio = max(yield_guard_ratio, 0.0)
         self.cache_hit_io_cost_ratio = max(cache_hit_io_cost_ratio, 0.0)
+        self.enable_cache_hit_io_cost = enable_cache_hit_io_cost
         default_cost_tokens = max(
             self.base_chunked_prefill_size or self.max_prefill_tokens,
             self.min_chunk_size,
@@ -103,6 +105,7 @@ class SloAwarePrefillController:
         if initial_decode_cost_ms is not None:
             self.default_decode_cost_s = max(initial_decode_cost_ms / 1000.0, 1e-9)
         self._prefill_cost_points_s: list[tuple[int, float]] = []
+        self._prefill_cost_table_s: list[tuple[int, list[tuple[int, float]]]] = []
         self._decode_cost_points_s: list[tuple[int, float]] = []
         self._decode_cost_table_s: list[tuple[int, list[tuple[int, float]]]] = []
         self._prefill_cost_per_token_s = self.default_prefill_cost_per_token_s
@@ -137,6 +140,8 @@ class SloAwarePrefillController:
             waiting_queue=waiting_queue,
             running_batch=running_batch,
             chunked_req=chunked_req,
+            default_chunked_prefill_size=default_chunked_prefill_size,
+            default_prefill_max_requests=default_prefill_max_requests,
         )
         return self.make_decision_from_pressure_state(
             pressure_state=pressure_state,
@@ -151,6 +156,8 @@ class SloAwarePrefillController:
         waiting_queue: Sequence["Req"],
         running_batch: "ScheduleBatch",
         chunked_req: Optional["Req"],
+        default_chunked_prefill_size: Optional[int] = None,
+        default_prefill_max_requests: Optional[int] = None,
     ) -> SloAwarePrefillPressureState:
         now = time.perf_counter()
         decode_reqs = self._decode_reqs(running_batch.reqs)
@@ -162,7 +169,13 @@ class SloAwarePrefillController:
             ttft_future_hit_tokens,
             ttft_future_io_cost_s,
             ttft_cache_hit_rate,
-        ) = self._ttft_pressure(now, waiting_queue, chunked_req)
+        ) = self._ttft_pressure(
+            now,
+            waiting_queue,
+            chunked_req,
+            default_chunked_prefill_size=default_chunked_prefill_size,
+            default_prefill_max_requests=default_prefill_max_requests,
+        )
         return SloAwarePrefillPressureState(
             ttft_pressure=ttft_pressure,
             tpot_pressure=self._tpot_pressure(now, decode_reqs),
@@ -210,16 +223,13 @@ class SloAwarePrefillController:
         max_prefill_requests = default_prefill_max_requests
 
         min_prefill_cost_s = self._estimate_prefill_cost(self.min_chunk_size)
-        yield_guard_s = self._yield_guard_s(min_prefill_cost_s)
+        yield_guard_s = self._yield_guard_s()
         ttft_slack_s = self._ttft_slack_s(ttft_pressure)
-        yield_rhs_s = (
-            self._active_decode_cost_s + min_prefill_cost_s + yield_guard_s
-        )
+        yield_rhs_s = self._active_decode_cost_s + yield_guard_s
 
-        if objective == "tpot" and has_decode_work:
-            if self._can_yield_to_decode(ttft_pressure):
-                allow_prefill = False
-                yield_prefill_to_decode = True
+        if has_decode_work and self._can_yield_to_decode(ttft_pressure):
+            allow_prefill = False
+            yield_prefill_to_decode = True
 
         if chunked_req is not None:
             allow_prefill = True
@@ -260,6 +270,7 @@ class SloAwarePrefillController:
         *,
         prefill_cost_ms: Sequence[tuple[int, float]],
         decode_cost_ms: Sequence[tuple[int, float]] = (),
+        prefill_cost_by_batch_ms: Sequence[tuple[int, int, float]] = (),
         decode_cost_by_context_ms: Sequence[tuple[int, int, float]] = (),
     ) -> None:
         prefill_points = [
@@ -273,12 +284,19 @@ class SloAwarePrefillController:
             if batch_size > 0 and cost_ms > 0.0
         ]
         self._prefill_cost_points_s = self._monotonic_cost_points(prefill_points)
+        self._prefill_cost_table_s = self._build_prefill_cost_table(
+            prefill_cost_by_batch_ms
+        )
         self._decode_cost_points_s = self._monotonic_cost_points(decode_points)
         self._decode_cost_table_s = self._build_decode_cost_table(
             decode_cost_by_context_ms
         )
         if self._prefill_cost_points_s:
             tokens, cost_s = self._prefill_cost_points_s[-1]
+            self._prefill_cost_per_token_s = max(cost_s / max(tokens, 1), 1e-9)
+        if self._prefill_cost_table_s:
+            tokens = self.base_chunked_prefill_size or self.min_chunk_size
+            cost_s = self._estimate_prefill_cost(tokens, batch_size=1)
             self._prefill_cost_per_token_s = max(cost_s / max(tokens, 1), 1e-9)
         if self._decode_cost_table_s or self._decode_cost_points_s:
             self._decode_cost_s = self._decode_cost_for_batch(1, 0)
@@ -323,27 +341,23 @@ class SloAwarePrefillController:
     def _has_ttft_slack_for_decode_yield(self, ttft_pressure: float) -> bool:
         if ttft_pressure >= 1.0:
             return False
-        min_prefill_cost_s = self._estimate_prefill_cost(self.min_chunk_size)
-        guard_s = self._yield_guard_s(min_prefill_cost_s)
-        return (
-            self._ttft_slack_s(ttft_pressure)
-            > self._active_decode_cost_s + min_prefill_cost_s + guard_s
+        guard_s = self._yield_guard_s()
+        return self._ttft_slack_s(ttft_pressure) > (
+            self._active_decode_cost_s + guard_s
         )
 
     def _ttft_slack_s(self, ttft_pressure: float) -> float:
         return max((1.0 - ttft_pressure) * self.ttft_slo_s, 0.0)
 
-    def _yield_guard_s(self, min_prefill_cost_s: float) -> float:
-        return max(
-            2.0 * self._active_decode_cost_s,
-            0.2 * min_prefill_cost_s,
-            self.yield_guard_ratio * self.ttft_slo_s,
-        )
+    def _yield_guard_s(self) -> float:
+        return self.yield_guard_ratio * self.ttft_slo_s
 
-    def _estimate_prefill_cost(self, tokens: int) -> float:
+    def _estimate_prefill_cost(self, tokens: int, batch_size: int = 1) -> float:
         tokens = max(tokens, 0)
         if tokens == 0:
             return 0.0
+        if self._prefill_cost_table_s:
+            return self._batched_prefill_cost(tokens, batch_size)
         if self._prefill_cost_points_s:
             return self._profiled_cost(self._prefill_cost_points_s, tokens)
         return tokens * max(self._active_prefill_cost_per_token_s, 1e-9)
@@ -385,6 +399,52 @@ class SloAwarePrefillController:
         prev_cost_s = self._profiled_cost(prev_points, batch_size)
         slope = max((last_cost_s - prev_cost_s) / max(last_ctx - prev_ctx, 1), 0.0)
         return last_cost_s + (context_len - last_ctx) * slope
+
+    def _build_prefill_cost_table(
+        self, prefill_cost_by_batch_ms: Sequence[tuple[int, int, float]]
+    ) -> list[tuple[int, list[tuple[int, float]]]]:
+        grouped: dict[int, list[tuple[int, float]]] = {}
+        for tokens, batch_size, cost_ms in prefill_cost_by_batch_ms:
+            if tokens <= 0 or batch_size <= 0 or cost_ms <= 0.0:
+                continue
+            grouped.setdefault(int(batch_size), []).append(
+                (int(tokens), float(cost_ms) / 1000.0)
+            )
+        return [
+            (batch_size, self._monotonic_cost_points(points))
+            for batch_size, points in sorted(grouped.items())
+        ]
+
+    def _batched_prefill_cost(self, tokens: int, batch_size: int) -> float:
+        table = self._prefill_cost_table_s
+        if not table:
+            if self._prefill_cost_points_s:
+                return self._profiled_cost(self._prefill_cost_points_s, tokens)
+            return tokens * max(self._active_prefill_cost_per_token_s, 1e-9)
+
+        batch_size = max(int(batch_size), 1)
+        if batch_size <= table[0][0] or len(table) == 1:
+            return self._profiled_cost(table[0][1], tokens)
+
+        for (left_bs, left_points), (right_bs, right_points) in zip(
+            table, table[1:]
+        ):
+            if batch_size <= right_bs:
+                left_cost_s = self._profiled_cost(left_points, tokens)
+                right_cost_s = max(
+                    self._profiled_cost(right_points, tokens), left_cost_s
+                )
+                ratio = (batch_size - left_bs) / max(right_bs - left_bs, 1)
+                return left_cost_s + ratio * (right_cost_s - left_cost_s)
+
+        prev_bs, prev_points = table[-2] if len(table) > 1 else (0, [])
+        last_bs, last_points = table[-1]
+        last_cost_s = self._profiled_cost(last_points, tokens)
+        if not prev_points or last_bs <= prev_bs:
+            return last_cost_s
+        prev_cost_s = self._profiled_cost(prev_points, tokens)
+        slope = max((last_cost_s - prev_cost_s) / max(last_bs - prev_bs, 1), 0.0)
+        return last_cost_s + (batch_size - last_bs) * slope
 
     def _build_decode_cost_table(
         self, decode_cost_by_context_ms: Sequence[tuple[int, int, float]]
@@ -451,16 +511,18 @@ class SloAwarePrefillController:
         return max(max(getattr(req, "seqlen", 0), 0) for req in decode_reqs)
 
     def _ttft_pressure(
-        self, now: float, waiting_queue: Sequence["Req"], chunked_req: Optional["Req"]
+        self,
+        now: float,
+        waiting_queue: Sequence["Req"],
+        chunked_req: Optional["Req"],
+        *,
+        default_chunked_prefill_size: Optional[int] = None,
+        default_prefill_max_requests: Optional[int] = None,
     ) -> tuple[float, float, int, int, float, float]:
         if self.ttft_slo_s <= 0:
             return 0.0, 0.0, 0, 0, 0.0, 0.0
-        pressures = []
-        future_costs_s = []
-        future_miss_tokens = []
-        future_hit_tokens = []
-        future_io_costs_s = []
-        cache_hit_rates = []
+
+        candidates = []
         for req in self._prefill_candidates(waiting_queue, chunked_req):
             entry = (
                 req.time_stats.wait_queue_entry_time
@@ -468,33 +530,188 @@ class SloAwarePrefillController:
             )
             if entry <= 0.0:
                 continue
-            future_cost_s, miss_tokens, hit_tokens, io_cost_s, cache_hit_rate = (
-                self._estimate_future_prefill_cost(req)
+            future_miss_tokens, future_hit_tokens, cache_hit_rate = (
+                self._estimate_future_prefill_tokens(req)
             )
-            future_costs_s.append(future_cost_s)
+            candidates.append(
+                (
+                    req,
+                    entry,
+                    future_miss_tokens,
+                    future_hit_tokens,
+                    cache_hit_rate,
+                )
+            )
+
+        if not candidates:
+            return 0.0, 0.0, 0, 0, 0.0, 0.0
+
+        estimated_remaining_costs_s, estimated_io_costs_s = (
+            self._estimate_prefill_backlog_costs(
+                candidates,
+                default_chunked_prefill_size=default_chunked_prefill_size,
+                default_prefill_max_requests=default_prefill_max_requests,
+            )
+        )
+
+        pressures = []
+        future_miss_tokens = []
+        future_hit_tokens = []
+        future_io_costs_s = []
+        cache_hit_rates = []
+        for idx, (_, entry, miss_tokens, hit_tokens, cache_hit_rate) in enumerate(
+            candidates
+        ):
+            estimated_remaining_cost_s = estimated_remaining_costs_s[idx]
+            pressures.append(
+                (now - entry + estimated_remaining_cost_s) / self.ttft_slo_s
+            )
             future_miss_tokens.append(float(miss_tokens))
             future_hit_tokens.append(float(hit_tokens))
-            future_io_costs_s.append(io_cost_s)
+            future_io_costs_s.append(estimated_io_costs_s[idx])
             cache_hit_rates.append(cache_hit_rate)
-            pressures.append((now - entry + future_cost_s) / self.ttft_slo_s)
+
         return (
             self._aggregate_pressure(pressures, self.ttft_stat),
-            self._aggregate_pressure(future_costs_s, self.ttft_stat),
+            self._aggregate_pressure(estimated_remaining_costs_s, self.ttft_stat),
             int(self._aggregate_pressure(future_miss_tokens, self.ttft_stat)),
             int(self._aggregate_pressure(future_hit_tokens, self.ttft_stat)),
             self._aggregate_pressure(future_io_costs_s, self.ttft_stat),
             self._aggregate_pressure(cache_hit_rates, self.ttft_stat),
         )
 
+    def _estimate_prefill_backlog_costs(
+        self,
+        candidates: Sequence[tuple["Req", float, int, int, float]],
+        *,
+        default_chunked_prefill_size: Optional[int],
+        default_prefill_max_requests: Optional[int],
+    ) -> tuple[list[float], list[float]]:
+        chunk_budget = self._prefill_cost_chunk_budget(default_chunked_prefill_size)
+        request_budget = max(
+            int(default_prefill_max_requests or len(candidates) or 1), 1
+        )
+        remaining_miss_tokens = [max(int(item[2]), 0) for item in candidates]
+        remaining_hit_tokens = [max(int(item[3]), 0) for item in candidates]
+        estimated_costs = [0.0 for _ in candidates]
+        estimated_io_costs = [0.0 for _ in candidates]
+        completed = [
+            miss_tokens == 0 and hit_tokens == 0
+            for miss_tokens, hit_tokens in zip(
+                remaining_miss_tokens, remaining_hit_tokens, strict=True
+            )
+        ]
+        queued_cost_s = 0.0
+
+        while not all(completed):
+            batch_entries: list[tuple[int, int, int]] = []
+            batch_miss_tokens = 0
+            batch_hit_tokens = 0
+            batch_budget_tokens = 0
+
+            for idx in range(len(candidates)):
+                if completed[idx]:
+                    continue
+                if len(batch_entries) >= request_budget:
+                    break
+
+                miss_tokens = remaining_miss_tokens[idx]
+                hit_tokens = remaining_hit_tokens[idx]
+                total_tokens = miss_tokens + hit_tokens
+                if total_tokens <= 0:
+                    completed[idx] = True
+                    estimated_costs[idx] = queued_cost_s
+                    continue
+
+                available_miss_budget = chunk_budget - batch_budget_tokens
+                if miss_tokens > 0 and available_miss_budget <= 0:
+                    break
+
+                take_miss_tokens = min(miss_tokens, max(available_miss_budget, 0))
+                take_hit_tokens = (
+                    hit_tokens if take_miss_tokens > 0 or miss_tokens == 0 else 0
+                )
+                if take_miss_tokens == 0 and take_hit_tokens == 0:
+                    break
+
+                batch_entries.append((idx, take_miss_tokens, take_hit_tokens))
+                batch_miss_tokens += take_miss_tokens
+                batch_hit_tokens += take_hit_tokens
+                batch_budget_tokens += take_miss_tokens
+
+            if not batch_entries:
+                break
+
+            compute_batch_size = sum(
+                1 for _, take_miss_tokens, _ in batch_entries if take_miss_tokens > 0
+            )
+            io_batch_size = sum(
+                1 for _, _, take_hit_tokens in batch_entries if take_hit_tokens > 0
+            )
+            batch_compute_cost_s = self._estimate_prefill_cost(
+                batch_miss_tokens, batch_size=compute_batch_size
+            )
+            batch_io_cost_s = self._estimate_cache_hit_io_cost(
+                batch_hit_tokens, batch_size=max(io_batch_size, 1)
+            )
+            batch_cost_s = batch_compute_cost_s + batch_io_cost_s
+            queued_cost_s += batch_cost_s
+
+            for idx, take_miss_tokens, take_hit_tokens in batch_entries:
+                remaining_miss_tokens[idx] = max(
+                    remaining_miss_tokens[idx] - take_miss_tokens, 0
+                )
+                remaining_hit_tokens[idx] = max(
+                    remaining_hit_tokens[idx] - take_hit_tokens, 0
+                )
+                if take_hit_tokens > 0:
+                    estimated_io_costs[idx] += (
+                        batch_io_cost_s * take_hit_tokens / max(batch_hit_tokens, 1)
+                    )
+                if (
+                    remaining_miss_tokens[idx] == 0
+                    and remaining_hit_tokens[idx] == 0
+                ):
+                    completed[idx] = True
+                    estimated_costs[idx] = queued_cost_s
+
+        for idx, is_completed in enumerate(completed):
+            if not is_completed:
+                estimated_costs[idx] = max(estimated_costs[idx], queued_cost_s)
+        return estimated_costs, estimated_io_costs
+
+    def _prefill_cost_chunk_budget(
+        self, default_chunked_prefill_size: Optional[int]
+    ) -> int:
+        chunk_budget = (
+            default_chunked_prefill_size
+            or self.base_chunked_prefill_size
+            or self.max_prefill_tokens
+        )
+        return max(1, min(int(chunk_budget), self.max_prefill_tokens))
+
+    def _estimate_cache_hit_io_cost(self, hit_tokens: int, batch_size: int) -> float:
+        if (
+            hit_tokens <= 0
+            or not self.enable_cache_hit_io_cost
+            or self.cache_hit_io_cost_ratio <= 0.0
+        ):
+            return 0.0
+        return self.cache_hit_io_cost_ratio * self._estimate_prefill_cost(
+            hit_tokens, batch_size=batch_size
+        )
+
     def _estimate_future_prefill_cost(
-        self, req: "Req"
+        self, req: "Req", batch_size: int = 1
     ) -> tuple[float, int, int, float, float]:
         future_miss_tokens, future_hit_tokens, cache_hit_rate = (
             self._estimate_future_prefill_tokens(req)
         )
-        compute_cost_s = self._estimate_prefill_cost(future_miss_tokens)
-        io_cost_s = self.cache_hit_io_cost_ratio * self._estimate_prefill_cost(
-            future_hit_tokens
+        compute_cost_s = self._estimate_prefill_cost(
+            future_miss_tokens, batch_size=batch_size
+        )
+        io_cost_s = self._estimate_cache_hit_io_cost(
+            future_hit_tokens, batch_size=batch_size
         )
         return (
             compute_cost_s + io_cost_s,

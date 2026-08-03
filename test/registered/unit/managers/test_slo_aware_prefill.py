@@ -86,8 +86,8 @@ class TestSloAwarePrefillController(unittest.TestCase):
 
         decision = controller.make_decision_from_pressure_state(
             pressure_state=SloAwarePrefillPressureState(
-                ttft_pressure=0.5,
-                tpot_pressure=0.7,
+                ttft_pressure=0.7,
+                tpot_pressure=1.0,
                 has_decode_work=True,
                 decode_cost_s=0.3,
             ),
@@ -264,8 +264,39 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.0)
         self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.0)
 
-    def test_ttft_future_cost_uses_request_cache_hit_rate(self):
+    def test_ttft_future_cost_uses_request_cache_hit_rate_without_default_io_cost(self):
         controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(512, 400.0), (1024, 800.0)],
+            decode_cost_ms=[(1, 10.0)],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024, cached=512)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_pressure, 0.6, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.4, delta=0.05)
+        self.assertEqual(decision.ttft_future_miss_tokens, 512)
+        self.assertEqual(decision.ttft_future_hit_tokens, 512)
+        self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.0)
+        self.assertAlmostEqual(decision.ttft_cache_hit_rate, 0.5)
+
+    def test_ttft_future_cost_can_enable_cache_hit_io_cost(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            min_chunk_size=None,
+            cache_hit_io_cost_ratio=0.3,
+        )
         controller.set_startup_cost_profile(
             prefill_cost_ms=[(512, 400.0), (1024, 800.0)],
             decode_cost_ms=[(1, 10.0)],
@@ -317,6 +348,138 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertEqual(decision.ttft_future_hit_tokens, 512)
         self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.0)
 
+    def test_ttft_future_cost_can_disable_cache_hit_io_cost_by_feature_flag(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            min_chunk_size=None,
+            cache_hit_io_cost_ratio=0.3,
+            enable_cache_hit_io_cost=False,
+        )
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(512, 400.0), (1024, 800.0)],
+            decode_cost_ms=[(1, 10.0)],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.2, seqlen=1024, cached=512)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_pressure, 0.6, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.4, delta=0.05)
+        self.assertEqual(decision.ttft_future_hit_tokens, 512)
+        self.assertAlmostEqual(decision.ttft_future_io_cost_s, 0.0)
+
+    def test_batched_prefill_cost_uses_batch_size_profile(self):
+        controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[],
+            prefill_cost_by_batch_ms=[
+                (1024, 1, 100.0),
+                (1024, 2, 160.0),
+                (1024, 4, 220.0),
+            ],
+        )
+
+        self.assertAlmostEqual(controller._estimate_prefill_cost(1024, 1), 0.100)
+        self.assertAlmostEqual(controller._estimate_prefill_cost(1024, 2), 0.160)
+        self.assertAlmostEqual(controller._estimate_prefill_cost(1024, 4), 0.220)
+        self.assertAlmostEqual(controller._estimate_prefill_cost(512, 2), 0.080)
+
+    def test_ttft_pressure_uses_batched_prefill_backlog_cost(self):
+        controller = self.create_controller()
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[],
+            prefill_cost_by_batch_ms=[
+                (1024, 1, 100.0),
+                (1024, 2, 160.0),
+            ],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[
+                FakeReq(wait_s=0.1, seqlen=512),
+                FakeReq(wait_s=0.1, seqlen=512),
+                FakeReq(wait_s=0.1, seqlen=512),
+            ],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.21, delta=0.02)
+        self.assertAlmostEqual(decision.ttft_pressure, 0.31, delta=0.03)
+
+    def test_ttft_pressure_splits_large_request_by_chunk_budget(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=8192,
+            max_prefill_tokens=32768,
+            page_size=1,
+            min_chunk_size=None,
+        )
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[],
+            prefill_cost_by_batch_ms=[(8192, 1, 800.0)],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[FakeReq(wait_s=0.1, seqlen=32768)],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=8192,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 3.2, delta=0.05)
+        self.assertAlmostEqual(decision.ttft_pressure, 3.3, delta=0.05)
+
+    def test_ttft_backlog_chunk_budget_counts_only_miss_tokens(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=2000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=8192,
+            max_prefill_tokens=32768,
+            page_size=1,
+            min_chunk_size=None,
+        )
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[],
+            prefill_cost_by_batch_ms=[
+                (1024, 1, 500.0),
+                (8192, 1, 800.0),
+                (8192, 2, 850.0),
+            ],
+        )
+        running = SimpleNamespace(reqs=[])
+
+        decision = controller.make_decision(
+            waiting_queue=[
+                FakeReq(wait_s=0.1, seqlen=8192, cached=7168),
+                FakeReq(wait_s=0.1, seqlen=7168),
+            ],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=8192,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.ttft_future_prefill_cost_s, 0.85, delta=0.05)
+        self.assertEqual(decision.ttft_future_miss_tokens, 7168)
+        self.assertEqual(decision.ttft_future_hit_tokens, 7168)
+
     def test_no_decode_uses_full_prefill_chunk(self):
         controller = self.create_controller()
         running = SimpleNamespace(reqs=[])
@@ -334,7 +497,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertEqual(decision.chunked_prefill_size, 1024)
         self.assertFalse(decision.yield_prefill_to_decode)
 
-    def test_balanced_slack_allows_prefill(self):
+    def test_ttft_objective_yields_decode_when_slack_is_safe(self):
         controller = self.create_controller()
         running = SimpleNamespace(
             reqs=[
@@ -355,9 +518,10 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertLess(decision.tpot_pressure, 1.0)
-        self.assertTrue(decision.allow_prefill)
-        self.assertFalse(decision.yield_prefill_to_decode)
         self.assertEqual(decision.objective, "ttft")
+        self.assertFalse(decision.allow_prefill)
+        self.assertTrue(decision.yield_prefill_to_decode)
+        self.assertGreater(decision.ttft_slack_s, decision.yield_rhs_s)
 
     def test_synced_pressure_can_yield_to_decode(self):
         controller = self.create_controller()
@@ -394,8 +558,8 @@ class TestSloAwarePrefillController(unittest.TestCase):
 
         decision = controller.make_decision_from_pressure_state(
             pressure_state=SloAwarePrefillPressureState(
-                ttft_pressure=0.5,
-                tpot_pressure=0.7,
+                ttft_pressure=0.8,
+                tpot_pressure=1.0,
                 has_decode_work=True,
                 prefill_cost_per_token_s=controller._prefill_cost_per_token_s,
                 decode_cost_s=controller._decode_cost_for_batch(1),
@@ -410,6 +574,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertFalse(decision.yield_prefill_to_decode)
         self.assertEqual(decision.chunked_prefill_size, 128)
         self.assertIsNone(decision.max_prefill_requests)
+        self.assertAlmostEqual(decision.yield_rhs_s, 0.22)
 
     def test_startup_cost_profile_drives_decode_yield(self):
         controller = self.create_controller()
@@ -437,6 +602,25 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertFalse(decision.allow_prefill)
         self.assertTrue(decision.yield_prefill_to_decode)
         self.assertAlmostEqual(decision.decode_cost_s, 0.02)
+        self.assertAlmostEqual(decision.yield_rhs_s, 0.02)
+
+    def test_yield_guard_uses_only_slo_ratio(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=2000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            min_chunk_size=128,
+            yield_guard_ratio=0.1,
+        )
+        controller.set_startup_cost_profile(
+            prefill_cost_ms=[(128, 1000.0)],
+            decode_cost_ms=[(1, 1000.0)],
+        )
+        controller._active_decode_cost_s = 1.0
+
+        self.assertAlmostEqual(controller._yield_guard_s(), 0.2)
 
     def test_contextual_decode_cost_interpolates_context_buckets(self):
         controller = self.create_controller()
@@ -627,8 +811,9 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
 
         self.assertEqual(decision.objective, "ttft")
-        self.assertTrue(decision.allow_prefill)
-        self.assertFalse(decision.yield_prefill_to_decode)
+        self.assertFalse(decision.allow_prefill)
+        self.assertTrue(decision.yield_prefill_to_decode)
+        self.assertGreater(decision.ttft_slack_s, decision.yield_rhs_s)
 
     def test_high_tpot_low_ttft_can_delay_prefill(self):
         controller = self.create_controller()

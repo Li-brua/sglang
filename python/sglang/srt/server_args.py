@@ -794,14 +794,17 @@ class ServerArgs:
     enable_slo_aware_prefill: A[
         bool,
         "Enable an experimental SLO-aware controller that dynamically adjusts chunked prefill admission based on TTFT/TPOT pressure.",
+        NS("schedule"),
     ] = False
     slo_prefill_ttft_slo_ms: A[
         Optional[float],
         "TTFT SLO in milliseconds for --enable-slo-aware-prefill.",
+        NS("schedule"),
     ] = None
     slo_prefill_tpot_slo_ms: A[
         Optional[float],
         "TPOT SLO in milliseconds for --enable-slo-aware-prefill.",
+        NS("schedule"),
     ] = None
     slo_prefill_ttft_stat: A[
         str,
@@ -809,6 +812,7 @@ class ServerArgs:
             help="Statistic used to aggregate TTFT pressure for --enable-slo-aware-prefill.",
             choices=["max", "mean", "p90"],
         ),
+        NS("schedule"),
     ] = "max"
     slo_prefill_tpot_stat: A[
         str,
@@ -816,42 +820,64 @@ class ServerArgs:
             help="Statistic used to aggregate TPOT pressure for --enable-slo-aware-prefill.",
             choices=["max", "mean", "p90"],
         ),
+        NS("schedule"),
     ] = "max"
     slo_prefill_initial_prefill_cost_ms_per_1k: A[
         Optional[float],
         "Warm-start prefill cost for --enable-slo-aware-prefill in milliseconds per 1K input tokens.",
+        NS("schedule"),
     ] = None
     slo_prefill_initial_decode_cost_ms: A[
         Optional[float],
         "Warm-start decode iteration cost for --enable-slo-aware-prefill in milliseconds.",
+        NS("schedule"),
     ] = None
     disable_slo_prefill_startup_profiling: A[
         bool,
         "Disable startup forward profiling for SLO-aware prefill Cp/Cd cost tables.",
+        NS("schedule"),
     ] = False
+    disable_slo_prefill_online_cost_model: A[
+        bool,
+        Arg(
+            help=(
+                "Disable online updates to SLO-aware prefill Cp/Cd cost estimates. "
+                "Disabled by default; use --no-disable-slo-prefill-online-cost-model "
+                "to allow future online cost-model updates."
+            ),
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("schedule"),
+    ] = True
     slo_prefill_profile_decode_context_len: A[
         int,
         "Synthetic context length per request for startup SLO decode Cd profiling when context length buckets are not specified.",
+        NS("schedule"),
     ] = 128
     slo_prefill_profile_decode_context_lens: A[
         Optional[List[int]],
         "Synthetic context length buckets per request for startup SLO decode Cd profiling.",
+        NS("schedule"),
     ] = None
     slo_prefill_profile_decode_batch_sizes: A[
         Optional[List[int]],
         "Explicit decode batch sizes for startup SLO Cd profiling. Defaults to captured decode cuda graph sizes.",
+        NS("schedule"),
     ] = None
     slo_prefill_yield_guard_ratio: A[
         float,
         "Safety guard as a fraction of TTFT SLO for SLO-aware decode-yield slack checks.",
+        NS("schedule"),
     ] = 0.05
     slo_prefill_cache_hit_io_cost_ratio: A[
         float,
         "IO cost multiplier for future cache-hit tokens in SLO TTFT future prefill cost estimation.",
-    ] = 0.3
+        NS("schedule"),
+    ] = 0.0
     slo_prefill_min_chunk_size: A[
         Optional[int],
         "Minimum chunk size for --enable-slo-aware-prefill when TPOT pressure still requires a prefill step. Defaults to the effective chunked prefill size.",
+        NS("schedule"),
     ] = None
     schedule_policy: A[
         str,

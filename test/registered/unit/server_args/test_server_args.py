@@ -41,6 +41,35 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_slo_prefill_online_cost_model_disabled_by_default(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(["--model", "dummy"])
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertTrue(server_args.disable_slo_prefill_online_cost_model)
+
+    def test_slo_prefill_online_cost_model_can_be_enabled(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            ["--model", "dummy", "--no-disable-slo-prefill-online-cost-model"]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertFalse(server_args.disable_slo_prefill_online_cost_model)
+
+    def test_slo_prefill_cache_hit_io_cost_ratio_defaults_to_zero(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(["--model", "dummy"])
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertEqual(server_args.slo_prefill_cache_hit_io_cost_ratio, 0.0)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
