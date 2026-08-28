@@ -119,10 +119,8 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_parallel,
-    get_server_args,
 )
 from sglang.srt.utils import is_blackwell_supported, is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
@@ -2147,7 +2145,7 @@ class KimiK3DecoderLayer(nn.Module):
         self._dp_attention = is_dp_attention_enabled()
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
         # attn_tp multiples; attention must then run on the real rows only.
-        self._trim_padded_attn = require_mlp_sync(get_server_args())
+        self._trim_padded_attn = require_mlp_sync()
         # A layer runs MoE (vs a plain dense MLP) iff it is past the dense
         # prefix and on the MoE cadence — same predicate the mlp construction
         # below uses.
@@ -2615,7 +2613,7 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_pp_group()
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
-        self._trim_padded_attn = require_mlp_sync(get_server_args())
+        self._trim_padded_attn = require_mlp_sync()
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3384,7 +3382,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             # Match the configured TP consumer count captured when the
             # tokenizer creates MmItemMemoryPool. A live attention subgroup
             # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(configured_tp_size(), 1)
+            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
