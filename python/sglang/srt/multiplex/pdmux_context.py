@@ -19,6 +19,10 @@ class PDMuxConfig:
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
+    # Overlap mode: prefill keeps its green-context SM cap while decode runs on
+    # plain full-device streams, so the two SM sets deliberately overlap and the
+    # manual_divisions decode_sm column is ignored.
+    overlap_decode_full_sm: bool = False
 
 
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
@@ -44,11 +48,20 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
             f"but got {len(manual_divisions)}"
         )
 
+    overlap_decode_full_sm = raw.get("overlap_decode_full_sm", False)
+    if overlap_decode_full_sm and not manual_divisions:
+        raise ValueError(
+            "overlap_decode_full_sm requires explicit manual_divisions: the "
+            "automatic divide_sm split enforces prefill >= 50% for mutually "
+            "exclusive partitions, which does not describe an overlapped one."
+        )
+
     return PDMuxConfig(
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
+        overlap_decode_full_sm=overlap_decode_full_sm,
     )
 
 
@@ -121,6 +134,28 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
             config.sm_group_num - 2,
         )
 
+    if config.overlap_decode_full_sm:
+        for prefill_sm, _ in divisions:
+            if not 0 < prefill_sm < total_sm_count:
+                raise ValueError(
+                    f"overlap_decode_full_sm needs a prefill_sm strictly inside "
+                    f"(0, {total_sm_count}); got {prefill_sm}. A full-device cap "
+                    f"leaves decode no SMs of its own."
+                )
+        # Decode reaches every SM, so its column records the full device.
+        divisions = [(prefill_sm, total_sm_count) for prefill_sm, _ in divisions]
+    else:
+        for prefill_sm, decode_sm in divisions:
+            if prefill_sm + decode_sm > total_sm_count:
+                raise ValueError(
+                    f"manual_divisions entry ({prefill_sm}, {decode_sm}) needs "
+                    f"{prefill_sm + decode_sm} SMs but the device has "
+                    f"{total_sm_count}. Mutually exclusive partitions must sum to "
+                    f"at most the device size; a decode_sm of {total_sm_count} "
+                    f"describes the overlapped layout, which needs "
+                    f"overlap_decode_full_sm: true."
+                )
+
     SM_COUNTS = []
     SM_COUNTS.append((total_sm_count, 0))  # Normal stream for prefill
     SM_COUNTS.extend(divisions)  # Add the divided SM counts
@@ -130,9 +165,23 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for prefill
     for prefill_sm, decode_sm in divisions:
-        STREAM_GROUPS.append(
-            (spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id))
-        )
+        if config.overlap_decode_full_sm:
+            # Only prefill is capped. Its green context is created as one half of
+            # a pair; the complementary stream is dropped, which is safe because
+            # the extension owns the green-context lifetime. Decode then runs on
+            # a high-priority plain stream, whose implicit full-device mask both
+            # overlaps the prefill partition and reaches the SMs outside it.
+            prefill_stream, _unused_decode_stream = (
+                spatial.create_greenctx_stream_by_value(
+                    prefill_sm, total_sm_count - prefill_sm, gpu_id
+                )
+            )
+            decode_stream = torch.cuda.Stream(gpu_id, priority=-1)
+            STREAM_GROUPS.append((prefill_stream, decode_stream))
+        else:
+            STREAM_GROUPS.append(
+                (spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id))
+            )
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for decode

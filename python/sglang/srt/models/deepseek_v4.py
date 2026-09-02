@@ -2594,7 +2594,12 @@ class DeepseekV4Model(nn.Module):
                     dtype=input_ids.dtype,
                     device=input_ids.device,
                 )
-                dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+                # Clone because the MAX_LEN gather may zero its local input in
+                # place; input_ids is snapshotted below and reused by every
+                # split segment's MoE and the final logits computation.
+                dp_gather_replicate(
+                    input_ids_global, input_ids[:, None].clone(), forward_batch
+                )
                 input_ids_global = input_ids_global.squeeze(-1)
             else:
                 input_ids_global = input_ids

@@ -2016,16 +2016,30 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
-    def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
+    def check_hicache_events(self) -> bool:
+        """Poll async HiCache events; called per scheduler step.
+
+        Returns whether this call may have enqueued DEVICE work (KV frees,
+        full-to-SWA mapping writes). Write/load ack retirement is host-only
+        bookkeeping (lock and refcount release); device mutations flow only
+        through write_back ack processing and the storage control queues.
+        Callers that overlap streams publish a dependency only when this
+        returns True.
+        """
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
+        write_back_policy = (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
         if self.pp_size != 1:
             self.writing_check()
             self.loading_check()
             if self.enable_storage:
                 self.drain_storage_control_queues()
+            # No per-call counts on this branch; report conservatively.
+            return write_back_policy or self.enable_storage
         else:
             (
                 write_finish_count,
@@ -2056,6 +2070,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        return (write_back_policy and write_finish_count > 0) or (
+            self.enable_storage and any(storage_queue_sizes)
+        )
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

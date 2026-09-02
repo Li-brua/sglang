@@ -8923,15 +8923,43 @@ class ServerArgs:
             assert (
                 self.pp_size == 1
             ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-            assert (
-                self.chunked_prefill_size == -1
-            ), "PD-Multiplexing is not compatible with chunked prefill."
+            if self.chunked_prefill_size > 0:
+                assert not self.enable_mixed_chunk, (
+                    "PD-Multiplexing is not compatible with mixed chunk: prefill "
+                    "and decode run on separate streams, so decode tokens cannot "
+                    "be mixed into prefill chunks."
+                )
             assert (
                 self.disaggregation_mode == "null"
             ), "PD-Multiplexing is not compatible with disaggregation mode."
             assert (
                 self.disable_overlap_schedule
             ), "PD-Multiplexing is not compatible with overlap schedule."
+
+            if (
+                self.enable_hierarchical_cache
+                and self.hicache_write_policy == "write_back"
+            ):
+                logger.warning(
+                    "PD-Multiplexing with --hicache-write-policy write_back: "
+                    "write-back eviction blocks the scheduler thread until every "
+                    "device-to-host transfer completes, which stalls the decode "
+                    "stream too. Prefer write_through."
+                )
+
+            if self.pdmux_config_path:
+                from sglang.srt.multiplex.pdmux_context import load_pdmux_config
+
+                # The decode attention-backend group is sized from the CLI value
+                # while the stream groups come from the YAML one; a mismatch only
+                # surfaces later as a stream-index error or a mis-paired backend.
+                yaml_sm_group_num = load_pdmux_config(
+                    self.pdmux_config_path
+                ).sm_group_num
+                assert yaml_sm_group_num == self.sm_group_num, (
+                    f"--sm-group-num must match the PD-Multiplexing config's "
+                    f"sm_group_num (CLI={self.sm_group_num}, YAML={yaml_sm_group_num})."
+                )
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch

@@ -582,6 +582,12 @@ class Scheduler(
         # Init chunked prefill
         self.init_chunked_prefill()
 
+        # Resolve the PDMux prefill-plan limit against the chunk budget just
+        # settled above; it reads self.chunked_prefill_size.
+        self.init_pdmux_prefill_plan_limit(
+            attn_backend=self.tp_worker.model_runner.attn_backend
+        )
+
         # Init diffusion LLM
         self.init_diffusion_llm()
 
@@ -1024,19 +1030,6 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        self.pdmux_max_prefill_plan_tokens = (
-            model_runner.attn_backend.max_prefill_plan_tokens
-            if self.enable_pdmux
-            else None
-        )
-        if self.pdmux_max_prefill_plan_tokens is not None:
-            logger.info(
-                "PDMux prefill planner hard limit: %s tokens",
-                self.pdmux_max_prefill_plan_tokens,
-            )
-        # Keep accepted requests within any hard PDMux backend limit. PDMux
-        # cannot fall back to chunked prefill for an oversized first request.
-        self.max_req_input_len = self._get_max_req_input_len(self.max_req_input_len)
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -3179,6 +3172,20 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def check_hicache_events_if_enabled(self) -> bool:
+        """Drain HiCache transfer acks, host locks, and prefetch progress.
+
+        Batch formation is the normal caller, so every scheduling loop must
+        either form a batch or call this itself. The gate is load-bearing:
+        the base `tree_cache` leaves `check_hicache_events` unimplemented.
+        Returns whether the pump may have enqueued DEVICE work (KV frees,
+        mapping writes) that the caller must publish to other streams --
+        ack retirement alone is host-only bookkeeping and returns False.
+        """
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+            return bool(self.tree_cache.check_hicache_events())
+        return False
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3190,8 +3197,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
-            self.tree_cache.check_hicache_events()
+        self.check_hicache_events_if_enabled()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -3759,7 +3765,15 @@ class Scheduler(
                     )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
+                # Resolve only on the first segment: input_ids comes from the
+                # CPU staging there and is snapshotted into split_forward_batch.
+                # Later segments run with input_ids=None; letting resolve fire
+                # again would take its decode-style FutureMap gather -- reading
+                # rows this batch never stashed (uninitialized memory) on the
+                # prefill stream, concurrent with decode's stash writes into
+                # the same buffer -- and discard the result anyway.
+                if batch.split_index == 0:
+                    resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
