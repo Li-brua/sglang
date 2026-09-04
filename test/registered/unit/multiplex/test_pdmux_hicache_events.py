@@ -78,21 +78,6 @@ class _EmptyDecodeBatch(_DecodeBatch):
         return True
 
 
-class _VariableDecodeBatch:
-    def __init__(self, batch_size):
-        self._batch_size = batch_size
-        self.batch_is_full = False
-
-    def is_empty(self):
-        return self._batch_size == 0
-
-    def batch_size(self):
-        return self._batch_size
-
-    def merge_batch(self, other):
-        pass
-
-
 class _SplitBatch:
     def __init__(self):
         self.split_index = 0
@@ -196,37 +181,6 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         return False
 
 
-class _ShrinkingDecodeScheduler(_FakeScheduler):
-    """Exercise a real stream handoff after update_running_batch shrinks BS."""
-
-    def __init__(self):
-        super().__init__(max_iterations=2, query_results=[])
-        self.real_sm_group_num = 4
-        self.pdmux_config.decode_bs_divisor = 1
-        self.running_batch = _VariableDecodeBatch(2)
-        self._decode_sizes = iter((2, 1))
-        self.handoff_indices = []
-        self.tp_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(update_decode_attn_backend=Mock())
-        )
-        self.stream_groups = [
-            (_Stream([]), _Stream([])) for _ in range(self.real_sm_group_num)
-        ]
-        self.sm_counts = [(1, 1)] * self.real_sm_group_num
-
-    def _select_stream_idx(self, running_batch):
-        return SchedulerMultiplexMixin._select_stream_idx(self, running_batch)
-
-    def update_running_batch(self, running_batch):
-        running_batch._batch_size = next(self._decode_sizes)
-        return running_batch
-
-    def adjust_stream_groups(self, running_batch):
-        stream_idx = SchedulerMultiplexMixin._select_stream_idx(self, running_batch)
-        self.handoff_indices.append(stream_idx)
-        return SchedulerMultiplexMixin.adjust_stream_groups(self, running_batch)
-
-
 @contextlib.contextmanager
 def _stubbed_cuda(current_idx=0):
     stream_idx = {"value": current_idx}
@@ -327,19 +281,6 @@ class TestPDMuxHiCacheEvents(unittest.TestCase):
         )
 
         self.assertEqual(scheduler.stream_groups[0][1].synchronize_calls, 0)
-
-    def test_decode_batch_shrink_handoffs_to_new_sm_partition(self):
-        """A non-empty 2 -> 1 decode drain must cross the partition boundary."""
-        scheduler = _ShrinkingDecodeScheduler()
-        with _stubbed_cuda(current_idx=2):
-            try:
-                scheduler.event_loop_pdmux()
-            except _LoopFinished:
-                pass
-
-        self.assertEqual(scheduler.handoff_indices, [1])
-        update_backend = scheduler.tp_worker.model_runner.update_decode_attn_backend
-        update_backend.assert_called_once_with(1)
 
 
 if __name__ == "__main__":

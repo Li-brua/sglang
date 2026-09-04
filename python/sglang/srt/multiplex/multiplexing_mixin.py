@@ -106,28 +106,6 @@ class SchedulerMultiplexMixin:
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
-    def _handoff_stream_group(
-        self: Scheduler,
-        prefill_stream,
-        decode_stream,
-        running_batch: ScheduleBatch,
-    ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
-        """Move to the selected SM layout without blocking the scheduler.
-
-        Both streams can mutate allocator and batch tensors consumed by either
-        stream in the next layout. Record their tails before selecting the new
-        group, then make both destination streams wait for both tails.
-        """
-        prefill_tail = prefill_stream.record_event()
-        decode_tail = decode_stream.record_event()
-        stream_idx, stream_group = self.adjust_stream_groups(
-            running_batch=running_batch
-        )
-        for stream in stream_group:
-            stream.wait_event(prefill_tail)
-            stream.wait_event(decode_tail)
-        return stream_idx, stream_group
-
     def update_split_prefill_batch(
         self: Scheduler, sm_count: int, running_batch: ScheduleBatch
     ) -> tuple[bool, ScheduleBatch]:
@@ -398,10 +376,11 @@ class SchedulerMultiplexMixin:
                         if self.check_hicache_events_if_enabled():
                             formation_done = prefill_stream.record_event()
                 if not wait_prefill_kernel_done:
-                    _, running_batch = self.update_split_prefill_batch(
+                    created, running_batch = self.update_split_prefill_batch(
                         sm_count, running_batch=running_batch
                     )
                     self.running_batch = running_batch
+                    adjust_stream_group = created or adjust_stream_group
                     if not had_inflight_split:
                         # Batch formation enqueued radix-cache and allocator
                         # work (prefix-match concatenations, evictions, KV
@@ -423,23 +402,17 @@ class SchedulerMultiplexMixin:
                     decode_stream.wait_event(formation_done)
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
-
-                # Re-evaluate the layout after filtering completed decode
-                # requests.  This catches both decode-batch shrinkage during a
-                # split prefill and the normal full-device transitions when no
-                # split is in flight, while avoiding a handoff within one
-                # partition's batch-size range.
                 adjust_stream_group = adjust_stream_group or (
-                    self._select_stream_idx(running_batch) != stream_idx
+                    stream_idx > 0 and running_batch.is_empty()
                 )
                 if running_batch.is_empty() and self.split_prefill_batch is None:
                     self.on_idle()
 
             if adjust_stream_group:
-                stream_idx, stream_group = self._handoff_stream_group(
-                    prefill_stream,
-                    decode_stream,
-                    running_batch=running_batch,
+                prefill_stream.synchronize()
+                decode_stream.synchronize()
+                stream_idx, stream_group = self.adjust_stream_groups(
+                    running_batch=running_batch
                 )
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
@@ -514,6 +487,4 @@ class SchedulerMultiplexMixin:
                             running_batch,
                         )
                         wait_prefill_kernel_done = False
-                        adjust_stream_group = (
-                            self._select_stream_idx(running_batch) != stream_idx
-                        )
+                        adjust_stream_group = True

@@ -640,33 +640,6 @@ manual_divisions:
     def test_blackwell_uses_eight_sm_green_context_granularity(self):
         self.assertEqual(pdmux_context.get_arch_constraints((10, 0)), (8, 8))
 
-    def test_stream_group_handoff_uses_events_without_host_sync(self):
-        prefill_tail = object()
-        decode_tail = object()
-        old_prefill = Mock()
-        old_prefill.record_event.return_value = prefill_tail
-        old_decode = Mock()
-        old_decode.record_event.return_value = decode_tail
-        new_prefill = Mock()
-        new_decode = Mock()
-        scheduler = SimpleNamespace(
-            adjust_stream_groups=Mock(return_value=(2, (new_prefill, new_decode)))
-        )
-        running_batch = object()
-
-        result = SchedulerMultiplexMixin._handoff_stream_group(
-            scheduler, old_prefill, old_decode, running_batch
-        )
-
-        self.assertEqual(result, (2, (new_prefill, new_decode)))
-        old_prefill.synchronize.assert_not_called()
-        old_decode.synchronize.assert_not_called()
-        for stream in (new_prefill, new_decode):
-            self.assertEqual(
-                stream.wait_event.call_args_list,
-                [unittest.mock.call(prefill_tail), unittest.mock.call(decode_tail)],
-            )
-
     def test_pdmux_process_status_does_not_follow_prefill_phase(self):
         with patch.object(parallel_state, "_PDMUX_PREFILL_TP_GROUP", object()):
             set_pdmux_status(False)
