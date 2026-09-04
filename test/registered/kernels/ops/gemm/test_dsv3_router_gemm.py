@@ -2,6 +2,7 @@
 
 import itertools
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from sglang.kernels.jit.utils import (
     get_jit_cuda_arch,
     is_hip_runtime,
 )
+from sglang.kernels.ops.attention.dsv4.gemm import linear_bf16_fp32
 from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -62,6 +64,31 @@ def test_dsv3_router_gemm(num_experts, hidden_dim, num_tokens, out_dtype):
     assert out.shape == (num_tokens, num_experts)
     assert out.dtype == out_dtype
     torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_pdmux_router_gemm_chunks_large_batch():
+    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+        pytest.skip("SM90+ required")
+
+    mat_a = torch.randn(24, 4096, dtype=torch.bfloat16, device="cuda")
+    mat_b = torch.randn(256, 4096, dtype=torch.bfloat16, device="cuda")
+    ref = _ref(mat_a, mat_b, torch.float32)
+
+    # Simulate a PDMux Green Context stream without requiring distributed
+    # initialization; the production predicate additionally checks the stream.
+    with patch(
+        "sglang.kernels.ops.attention.dsv4.gemm._is_pdmux_green_stream",
+        return_value=True,
+    ), patch(
+        "sglang.kernels.ops.attention.dsv4.gemm._pdmux_use_dsv3_router_gemm",
+        True,
+    ):
+        out = linear_bf16_fp32(mat_a, mat_b)
+
+    assert out.shape == (24, 256)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
 
 
 if __name__ == "__main__":

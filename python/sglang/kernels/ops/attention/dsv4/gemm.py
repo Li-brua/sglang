@@ -22,6 +22,13 @@ _HPC_GEMM_WEIGHT_SCALE = 1.0 / 256.0
 # Set at model init, never lazily, so all ranks agree; see
 # mark_hpc_bf16xfp32_gemm_enabled.
 _hpc_gemm_enabled = False
+# The fallback kernel is safe on SM-partitioned Green Context streams, but it
+# handles only 16 rows per launch. The old PDMux path used one cuBLAS GEMM and
+# is substantially faster for large prefill batches, so keep that behavior as
+# the default and make the workaround an explicit opt-in.
+_pdmux_use_dsv3_router_gemm = envs.SGLANG_PDMUX_USE_DSV3_ROUTER_GEMM.get()
+_DSV3_ROUTER_MAX_TOKENS = 16
+_DSV3_ROUTER_EXPERTS = (256, 384)
 
 
 @functools.cache
@@ -112,7 +119,62 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
     return _linear_bf16_fp32_algo == "hpc" and _hpc_gemm_bf16xfp32_available()
 
 
+def _is_pdmux_green_stream(device: torch.device) -> bool:
+    from sglang.srt.distributed.parallel_state import is_pdmux_enabled
+
+    if not is_pdmux_enabled():
+        return False
+
+    from sglang.srt.multiplex.pdmux_context import is_green_context_stream
+
+    current_stream = torch.cuda.current_stream(device).cuda_stream
+    return is_green_context_stream(current_stream)
+
+
+def _can_use_pdmux_dsv3_router_gemm(x: torch.Tensor, y: torch.Tensor) -> bool:
+    """Whether the Green Context-safe DSV3 router GEMM can handle this shape."""
+    if not _pdmux_use_dsv3_router_gemm:
+        return False
+    if not (x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16):
+        return False
+    if x.dim() != 2 or y.dim() != 2 or x.shape[1] != y.shape[1]:
+        return False
+    if x.shape[0] <= _DSV3_ROUTER_MAX_TOKENS:
+        return False
+    if x.shape[1] % 1024 != 0 or y.shape[0] not in _DSV3_ROUTER_EXPERTS:
+        return False
+
+    # cuBLAS BF16 GEMM is not reliable on the SM-partitioned streams created by
+    # PDMux. Keep the workaround off the full-SM prefill/decode streams so
+    # ordinary execution retains the faster cuBLAS path.
+    return _is_pdmux_green_stream(x.device)
+
+
+def _linear_bf16_fp32_pdmux_dsv3(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
+
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not y.is_contiguous():
+        y = y.contiguous()
+
+    output = torch.empty(
+        (x.shape[0], y.shape[0]), dtype=torch.float32, device=x.device
+    )
+    for start in range(0, x.shape[0], _DSV3_ROUTER_MAX_TOKENS):
+        end = min(start + _DSV3_ROUTER_MAX_TOKENS, x.shape[0])
+        dsv3_router_gemm(
+            x[start:end],
+            y,
+            out_dtype=torch.float32,
+            output=output[start:end],
+        )
+    return output
+
+
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if _can_use_pdmux_dsv3_router_gemm(x, y):
+        return _linear_bf16_fp32_pdmux_dsv3(x, y)
     if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     return torch.mm(x.float(), y.float().t())

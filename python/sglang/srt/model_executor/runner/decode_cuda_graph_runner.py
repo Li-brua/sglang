@@ -214,6 +214,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    @staticmethod
+    def _get_post_warmup_hook(attn_backend):
+        return getattr(attn_backend, "on_after_cuda_graph_warmup", None)
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1248,11 +1252,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dsa_variant,
                 )
                 # Adaptive runners may own a different backend than model_runner.
-                post_warmup_hook = getattr(
-                    attn_backend,
-                    "on_after_cuda_graph_warmup",
-                    None,
-                )
+                post_warmup_hook = self._get_post_warmup_hook(attn_backend)
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,

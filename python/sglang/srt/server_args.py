@@ -10360,15 +10360,29 @@ class ServerArgs:
             assert (
                 cfg.pp_size == 1
             ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-            assert (
-                cfg.chunked_prefill_size == -1
-            ), "PD-Multiplexing is not compatible with chunked prefill."
+            if cfg.chunked_prefill_size > 0:
+                assert not cfg.enable_mixed_chunk, (
+                    "PD-Multiplexing is not compatible with mixed chunk: prefill "
+                    "and decode run on separate streams, so decode tokens cannot "
+                    "be mixed into prefill chunks."
+                )
             assert (
                 cfg.disaggregation_mode == "null"
             ), "PD-Multiplexing is not compatible with disaggregation mode."
             assert (
                 cfg.disable_overlap_schedule
             ), "PD-Multiplexing is not compatible with overlap schedule."
+
+            if (
+                cfg.enable_hierarchical_cache
+                and cfg.hicache_write_policy == "write_back"
+            ):
+                logger.warning(
+                    "PD-Multiplexing with --hicache-write-policy write_back: "
+                    "write-back eviction blocks the scheduler thread until every "
+                    "device-to-host transfer completes, which stalls the decode "
+                    "stream too. Prefer write_through."
+                )
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch

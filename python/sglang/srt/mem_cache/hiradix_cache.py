@@ -1541,15 +1541,24 @@ class HiRadixCache(RadixCache):
         """
         return self.cache_controller.start_loading()
 
-    def check_hicache_events(self):
+    def check_hicache_events(self) -> bool:
+        """Poll async HiCache events; called per scheduler step.
+
+        Returns whether this call may have enqueued DEVICE work -- see
+        UnifiedRadixCache.check_hicache_events for the contract. Ack
+        retirement here is host-only; device mutations flow through
+        write_back ack processing and the storage control queues.
+        """
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
+        write_back_policy = self.cache_controller.write_policy == "write_back"
         if self.pp_size != 1:
             self.writing_check()
             self.loading_check()
             if self.enable_storage:
                 self.drain_storage_control_queues()
+            return write_back_policy or self.enable_storage
         else:
             (
                 write_finish_count,
@@ -1574,6 +1583,9 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        return (write_back_policy and write_finish_count > 0) or (
+            self.enable_storage and any(storage_queue_sizes)
+        )
 
     def drain_storage_control_queues(self):
         """

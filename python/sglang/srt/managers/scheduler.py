@@ -608,6 +608,12 @@ class Scheduler(
         # Init chunked prefill
         self.init_chunked_prefill()
 
+        # Resolve the PDMux prefill-plan limit against the chunk budget just
+        # settled above; it reads self.chunked_prefill_size.
+        self.init_pdmux_prefill_plan_limit(
+            attn_backend=self.tp_worker.model_runner.attn_backend
+        )
+
         # Init diffusion LLM
         self.init_diffusion_llm()
 
@@ -3340,6 +3346,20 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def check_hicache_events_if_enabled(self) -> bool:
+        """Drain HiCache transfer acks, host locks, and prefetch progress.
+
+        Batch formation is the normal caller, so every scheduling loop must
+        either form a batch or call this itself. The gate is load-bearing:
+        the base `tree_cache` leaves `check_hicache_events` unimplemented.
+        Returns whether the pump may have enqueued DEVICE work (KV frees,
+        mapping writes) that the caller must publish to other streams --
+        ack retirement alone is host-only bookkeeping and returns False.
+        """
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+            return bool(self.tree_cache.check_hicache_events())
+        return False
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3351,8 +3371,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
-            self.tree_cache.check_hicache_events()
+        self.check_hicache_events_if_enabled()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -3415,19 +3434,28 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        # DeepSeek V4 compressor plans encode ragged token ids as uint16. PDMux
+        # cannot use chunked prefill, so admission must keep the complete batch
+        # within that hard planner limit instead of treating max_prefill_tokens
+        # as a soft budget for the first request.
+        max_prefill_tokens, enforce_max_prefill_tokens = (
+            self._get_prefill_admission_config(self.max_prefill_tokens)
+        )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
+            enforce_max_prefill_tokens=enforce_max_prefill_tokens,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
@@ -3939,7 +3967,15 @@ class Scheduler(
                     )
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
+                # Resolve only on the first segment: input_ids comes from the
+                # CPU staging there and is snapshotted into split_forward_batch.
+                # Later segments run with input_ids=None; letting resolve fire
+                # again would take its decode-style FutureMap gather -- reading
+                # rows this batch never stashed (uninitialized memory) on the
+                # prefill stream, concurrent with decode's stash writes into
+                # the same buffer -- and discard the result anyway.
+                if batch.split_index == 0:
+                    resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
