@@ -1303,6 +1303,11 @@ class Envs:
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # Controls the load-time TileLang MHC-PRE JIT warmup independently from
+    # the forward kernel selection.  Keep this separate because prewarm needs
+    # a finite prefill token budget, while ``chunked_prefill_size=-1`` disables
+    # chunking and should not disable the optimized forward path.
+    SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)

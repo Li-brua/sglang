@@ -584,7 +584,20 @@ def prewarm_mhc_pre(
     from sglang.srt.runtime_context import get_schedule
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_schedule().chunked_prefill_size
+    # ``-1`` disables chunked prefill and is a valid scheduler sentinel, but
+    # it cannot be used as a tensor dimension.  In that mode prefill batches
+    # are bounded by ``max_prefill_tokens``; use that finite bound for optional
+    # JIT warmup.  If neither value is positive, there is nothing safe to
+    # prewarm and the first real forward will compile on demand.
+    schedule = get_schedule()
+    max_num_tokens = schedule.chunked_prefill_size
+    if max_num_tokens is None or max_num_tokens <= 0:
+        max_num_tokens = schedule.max_prefill_tokens
+    if max_num_tokens is None or max_num_tokens <= 0:
+        logger.warning(
+            "Skipping DeepSeek V4 MHC prenorm prewarm: no positive token budget"
+        )
+        return
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )
