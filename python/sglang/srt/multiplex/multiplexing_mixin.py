@@ -50,9 +50,7 @@ class SchedulerMultiplexMixin:
         )
 
     # TODO(jason-fxz): This is a temporary demo
-    def _select_stream_idx(
-        self: Scheduler, running_batch: ScheduleBatch
-    ) -> int:
+    def _select_stream_idx(self: Scheduler, running_batch: ScheduleBatch) -> int:
         """Select the SM layout for the current decode/prefill workload.
 
         This helper is intentionally side-effect free.  The scheduler uses it
@@ -103,7 +101,16 @@ class SchedulerMultiplexMixin:
 
         stream_idx = get_current_stream_idx()
 
-        self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
+        # Speculative decoding has target and draft runners. Let the active
+        # worker switch all of them so eager draft attention does not keep
+        # using the backend bound to the previous Green Context stream.
+        model_worker = getattr(self, "model_worker", None)
+        if model_worker is not None and hasattr(
+            model_worker, "update_pdmux_decode_attn_backend"
+        ):
+            model_worker.update_pdmux_decode_attn_backend(stream_idx)
+        else:
+            self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
     def update_split_prefill_batch(
@@ -173,9 +180,7 @@ class SchedulerMultiplexMixin:
                 proportional_work + decode_sm_count - 1
             ) // decode_sm_count
             proportional_layers = (
-                proportional_work
-                + self.split_prefill_batch.extend_num_tokens
-                - 1
+                proportional_work + self.split_prefill_batch.extend_num_tokens - 1
             ) // self.split_prefill_batch.extend_num_tokens
             forward_count = max(forward_count, proportional_layers)
 

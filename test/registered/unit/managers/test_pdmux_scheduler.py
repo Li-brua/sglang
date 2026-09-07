@@ -325,7 +325,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             yield
 
     def _make_stream_group_scheduler(self, *, manual_divisions, group_num):
-        model_runner = SimpleNamespace(update_decode_attn_backend=lambda _idx: None)
+        model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
         return SimpleNamespace(
             split_prefill_batch=object(),
             pdmux_config=SimpleNamespace(
@@ -371,6 +371,24 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         self.assertEqual(stream_idx, 2)
 
+    def test_stream_switch_updates_speculative_target_and_draft_backends(self):
+        scheduler = self._make_stream_group_scheduler(
+            manual_divisions=[[32, 0, 1]], group_num=3
+        )
+        scheduler.model_worker = SimpleNamespace(
+            update_pdmux_decode_attn_backend=Mock()
+        )
+        target_update = scheduler.tp_worker.model_runner.update_decode_attn_backend
+        running_batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 1)
+
+        with self._stubbed_stream_idx():
+            SchedulerMultiplexMixin.adjust_stream_groups(scheduler, running_batch)
+
+        scheduler.model_worker.update_pdmux_decode_attn_backend.assert_called_once_with(
+            1
+        )
+        target_update.assert_not_called()
+
     def test_stream_selection_shrinks_with_decode_batch_during_split_prefill(self):
         """A non-empty decode batch must move to the smaller layout as it drains.
 
@@ -381,9 +399,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         selector after filtering completed requests so it can trigger an event
         handoff before the next forward.
         """
-        scheduler = self._make_stream_group_scheduler(
-            manual_divisions=[], group_num=8
-        )
+        scheduler = self._make_stream_group_scheduler(manual_divisions=[], group_num=8)
         scheduler.pdmux_config.decode_bs_divisor = 36
 
         large_batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 36)
@@ -398,9 +414,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
     def test_stream_selection_does_not_resize_within_same_decode_partition(self):
         """Batch churn below a layout boundary should not pay another handoff."""
-        scheduler = self._make_stream_group_scheduler(
-            manual_divisions=[], group_num=8
-        )
+        scheduler = self._make_stream_group_scheduler(manual_divisions=[], group_num=8)
         scheduler.pdmux_config.decode_bs_divisor = 36
 
         batch_12 = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 12)
@@ -526,9 +540,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         ):
             SchedulerMultiplexMixin.init_pdmux(scheduler)
 
-        load_pdmux_config.assert_called_once_with(
-            "pdmux.yaml", default_sm_group_num=8
-        )
+        load_pdmux_config.assert_called_once_with("pdmux.yaml", default_sm_group_num=8)
         initialize_stream_groups.assert_called_once_with(3, config)
         self.assertEqual(scheduler.real_sm_group_num, 3)
 
@@ -595,9 +607,7 @@ manual_divisions:
                 pdmux_context.STREAM_GROUPS[1], (prefill_green, "decode-full")
             )
             self.assertEqual(pdmux_context.SM_COUNTS[1], (32, 128))
-            self.assertEqual(
-                pdmux_context._RESERVED_GREEN_STREAMS, [reserved_green]
-            )
+            self.assertEqual(pdmux_context._RESERVED_GREEN_STREAMS, [reserved_green])
             self.assertTrue(pdmux_context.is_green_context_stream(101))
             self.assertFalse(pdmux_context.is_green_context_stream(102))
             self.assertEqual(

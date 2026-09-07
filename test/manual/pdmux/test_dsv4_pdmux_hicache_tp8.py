@@ -36,6 +36,10 @@ from test.manual.pdmux.test_pdmux_hicache import (
 DSV4_FLASH_MODEL_PATH = os.environ.get(
     "SGLANG_TEST_DSV4_FLASH_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
 )
+DSV4_DSPARK_MODEL_PATH = os.environ.get(
+    "SGLANG_TEST_DSV4_DSPARK_MODEL_PATH",
+    "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+)
 
 DSV4_FLASH_ENV = {
     "SGLANG_DSV4_MHC_PREWARM": "0",
@@ -102,6 +106,24 @@ class TestDSV4PDMuxOverlappedMasksHiCache(DSV4PDMuxHiCacheMixin, CustomTestCase)
             f"split_forward_token_budget: {SPLIT_FORWARD_TOKEN_BUDGET}\n"
             "overlap_decode_full_sm: true\n"
             f"manual_divisions:\n{entries}"
+        )
+
+
+class TestDSV4PDMuxDSparkHiCache(DSV4PDMuxHiCacheMixin, CustomTestCase):
+    """DSV4 split prefill feeds DSpark while HiCache backs both KV pools."""
+
+    model_path = DSV4_DSPARK_MODEL_PATH
+    extra_server_args = [
+        *DSV4PDMuxHiCacheMixin.extra_server_args,
+        "--speculative-algorithm",
+        "DSPARK",
+    ]
+
+    @classmethod
+    def pdmux_config_body(cls) -> str:
+        return (
+            f"sm_group_num: {cls.sm_group_num}\n"
+            f"split_forward_token_budget: {SPLIT_FORWARD_TOKEN_BUDGET}\n"
         )
 
 

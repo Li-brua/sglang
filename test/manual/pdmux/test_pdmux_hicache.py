@@ -56,6 +56,11 @@ MAX_TOTAL_TOKENS = 8192
 # Bounds the eviction phase's runtime when the pool ends up larger than asked.
 MAX_EVICTION_ROUNDS = 32
 
+# Keep synthetic token IDs inside the vocabulary of both the small default
+# model and DSV4 while still producing distinct cyclic prompts per seed.
+PROMPT_TOKEN_BASE = 1000
+PROMPT_TOKEN_SPAN = 20000
+
 # Green-context partitions must be a multiple of 8 SMs to satisfy both the
 # Ampere (min 4, multiple 2) and Hopper (min 8, multiple 8) constraints.
 SM_GRANULARITY = 8
@@ -176,8 +181,11 @@ class PDMuxHiCacheMixin:
         requests.post(self.base_url + "/flush_cache", timeout=120).raise_for_status()
 
     def _prompt(self, seed) -> list:
-        base = 1000 + seed * self.prompt_len
-        return list(range(base, base + self.prompt_len))
+        offset = seed * self.prompt_len
+        return [
+            PROMPT_TOKEN_BASE + (offset + i) % PROMPT_TOKEN_SPAN
+            for i in range(self.prompt_len)
+        ]
 
     # --- cases -------------------------------------------------------------
 
