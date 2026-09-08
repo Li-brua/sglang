@@ -3966,37 +3966,6 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                # Resolve only on the first segment: input_ids comes from the
-                # CPU staging there and is snapshotted into split_forward_batch.
-                # Later segments run with input_ids=None; letting resolve fire
-                # again would take its decode-style FutureMap gather -- reading
-                # rows this batch never stashed (uninitialized memory) on the
-                # prefill stream, concurrent with decode's stash writes into
-                # the same buffer -- and discard the result anyway.
-                if batch.split_index == 0:
-                    resolve_forward_inputs(batch, self.future_map)
-                # Speculative workers may need to post-process the completed
-                # split prefill. DSpark injects captured target hidden states
-                # into its draft KV cache before decode starts.
-                split_worker = getattr(self, "model_worker", None) or self.tp_worker
-                batch_result = split_worker.forward_batch_split_prefill(batch)
-                if batch_result.next_draft_input is not None:
-                    # PDMux is synchronous at the scheduler level, so carry
-                    # speculative state on the batch itself. FutureMap only
-                    # resolves spec extras for overlap scheduling.
-                    batch.spec_info = batch_result.next_draft_input
-                    if batch_result.new_seq_lens is not None:
-                        batch.seq_lens = batch_result.new_seq_lens
-                        if batch.seq_lens_cpu is not None:
-                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                else:
-                    self._relay_forward_payload(
-                        batch, batch.req_pool_indices, batch_result
-                    )
-                batch.input_ids = None
-                self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).

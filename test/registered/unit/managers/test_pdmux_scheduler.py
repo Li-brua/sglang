@@ -92,79 +92,20 @@ class TestPDMuxScheduler(unittest.TestCase):
         self,
         *,
         decode_empty,
-        split_index=0,
         extend_num_tokens=128000,
-        token_budget=65536,
     ):
         return SimpleNamespace(
             model_config=SimpleNamespace(num_hidden_layers=61),
-            pdmux_config=SimpleNamespace(split_forward_token_budget=token_budget),
             running_batch=_Batch(decode_empty),
-            split_prefill_batch=SimpleNamespace(
-                split_index=split_index,
-                extend_num_tokens=extend_num_tokens,
-            ),
+            prefill_batch=SimpleNamespace(extend_num_tokens=extend_num_tokens),
         )
 
-    def test_prefill_runs_remaining_layers_without_decode_work(self):
-        scheduler = self._make_scheduler(decode_empty=True, split_index=7)
-
-        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
-
-        self.assertEqual(count, 54)
-
-    def test_prefill_uses_token_budget_with_decode_work(self):
+    def test_prefill_batch_keeps_the_token_chunk_mode(self):
+        """PDMux must not replace the normal token chunk with layer state."""
         scheduler = self._make_scheduler(decode_empty=False)
 
-        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
-
-        self.assertEqual(count, 1)
-
-    def test_prefill_count_is_clamped_to_remaining_layers(self):
-        scheduler = self._make_scheduler(
-            decode_empty=False,
-            split_index=59,
-            extend_num_tokens=8192,
-            token_budget=65536,
-        )
-
-        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
-
-        self.assertEqual(count, 2)
-
-    def test_exclusive_partition_avoids_underfilled_prefill_segment(self):
-        scheduler = self._make_scheduler(
-            decode_empty=False,
-            extend_num_tokens=1024,
-            token_budget=1024,
-        )
-        scheduler.running_batch.batch_size = lambda: 32
-
-        count = SchedulerMultiplexMixin._get_split_forward_count(
-            scheduler,
-            prefill_sm_count=96,
-            decode_sm_count=32,
-        )
-
-        # ceil((32 decode tokens * 61 layers * 96/32 SM ratio) / 1024)
-        self.assertEqual(count, 6)
-
-    def test_full_sm_decode_does_not_expand_prefill_segment(self):
-        scheduler = self._make_scheduler(
-            decode_empty=False,
-            extend_num_tokens=1024,
-            token_budget=1024,
-        )
-        scheduler.running_batch.batch_size = lambda: 32
-        scheduler.pdmux_config.overlap_decode_full_sm = True
-
-        count = SchedulerMultiplexMixin._get_split_forward_count(
-            scheduler,
-            prefill_sm_count=32,
-            decode_sm_count=128,
-        )
-
-        self.assertEqual(count, 1)
+        self.assertEqual(scheduler.prefill_batch.extend_num_tokens, 128000)
+        self.assertFalse(hasattr(scheduler.prefill_batch, "split_index"))
 
     def test_dsv4_prefill_admission_uses_planner_hard_limit(self):
         scheduler = SimpleNamespace(
@@ -286,7 +227,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertEqual(scheduler.max_req_input_len, 1048576)
 
     def test_init_tightens_request_length_without_chunked_prefill(self):
-        """Without chunking PDMux cannot split an oversized request, so init
+        """Without chunking PDMux cannot admit an oversized request, so init
         must clamp request validation to the planner limit."""
         scheduler = SimpleNamespace(
             enable_pdmux=True,
@@ -327,7 +268,7 @@ class TestPDMuxScheduler(unittest.TestCase):
     def _make_stream_group_scheduler(self, *, manual_divisions, group_num):
         model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
         return SimpleNamespace(
-            split_prefill_batch=object(),
+            prefill_batch=object(),
             pdmux_config=SimpleNamespace(
                 manual_divisions=manual_divisions, decode_bs_divisor=36
             ),
@@ -343,7 +284,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         so a batch below all of them left the index unbound -- an
         UnboundLocalError raised from the scheduler loop. A single-division
         config (`--sm-group-num 3`) whose threshold is above 1 hits this for
-        every small decode batch that overlaps a split prefill.
+        every small decode batch that overlaps a token chunk.
         """
         scheduler = self._make_stream_group_scheduler(
             manual_divisions=[[128, 0, 8]], group_num=3
@@ -389,7 +330,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
         target_update.assert_not_called()
 
-    def test_stream_selection_shrinks_with_decode_batch_during_split_prefill(self):
+    def test_stream_selection_shrinks_with_decode_batch_during_token_prefill(self):
         """A non-empty decode batch must move to the smaller layout as it drains.
 
         With six shared groups and the default divisor, a 132-SM device maps
@@ -460,26 +401,20 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertGreater(divisions[0][0], divisions[-1][0])
         self.assertGreater(divisions[-1][1], divisions[-1][0])
 
-    def test_split_prefill_forward_installs_hicache_consumer_first(self):
-        """Every split-prefill segment must install the HiCache consumer index
-        before running the model.
+    def test_pdmux_prefill_forward_installs_hicache_consumer_first(self):
+        """Every PDMux token chunk installs the HiCache consumer index first.
 
-        `set_hicache_consumer` selects which layer-transfer event set the KV
-        pool waits on before reading loaded-back pages, and the decode forward
-        that runs between segments resets it to the decode batch's -1 --
-        which disables the wait entirely. A segment that skips the install
-        therefore reads host-loaded KV while the transfer stream is still
-        copying: garbage indices out of the DSV4 top-k indexer and a
-        device-side IndexKernel assert under load (the PDMux + HiCache
-        benchmark crash of 2026-08-26). This is the only forward entry point
-        besides `forward_batch_generation`, which does install it.
+        `set_hicache_consumer` selects the transfer event set the KV pool waits
+        on before reading loaded-back pages. The ordinary generation forward
+        is the only PDMux prefill entry point and must install it before the
+        model reads the cache.
         """
         tree = ast.parse(TP_WORKER_PATH.read_text(encoding="utf-8"))
         method = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
-            and node.name == "forward_batch_split_prefill"
+            and node.name == "forward_batch_generation"
         )
         calls = [
             call.func.attr
@@ -685,7 +620,7 @@ manual_divisions:
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
         scheduler = SimpleNamespace(
             running_batch=running_batch,
-            split_prefill_batch=split_batch,
+            prefill_batch=split_batch,
             chunked_req=None,
             process_batch_result=Mock(),
         )
@@ -710,7 +645,7 @@ manual_divisions:
         )
         self.assertIs(merged_batch, running_batch)
         self.assertIs(scheduler.running_batch, running_batch)
-        self.assertIsNone(scheduler.split_prefill_batch)
+        self.assertIsNone(scheduler.prefill_batch)
 
     def test_merge_excludes_and_stashes_unfinished_chunked_request(self):
         """A request that only finished a middle chunk must be stashed and
@@ -720,7 +655,6 @@ manual_divisions:
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
         split_batch = Mock()
         split_batch.chunked_req = chunked_req
-        split_batch.split_prefill_finished = True
         split_batch.batch_size.side_effect = [2, 1]
         split_batch.is_empty.return_value = False
         split_batch.filter_batch.side_effect = lambda **kwargs: operations.append(
@@ -735,7 +669,7 @@ manual_divisions:
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
         scheduler = SimpleNamespace(
             running_batch=running_batch,
-            split_prefill_batch=split_batch,
+            prefill_batch=split_batch,
             chunked_req=chunked_req,
             process_batch_result=Mock(),
             stash_chunked_request=Mock(
@@ -760,7 +694,7 @@ manual_divisions:
             ["stash", "filter", "merge", "record", "wait"],
         )
         self.assertIs(merged_batch, running_batch)
-        self.assertIsNone(scheduler.split_prefill_batch)
+        self.assertIsNone(scheduler.prefill_batch)
 
     def test_merge_of_pure_middle_chunk_keeps_decode_batch(self):
         """A batch holding only a middle chunk merges nothing into decode, but
@@ -771,7 +705,6 @@ manual_divisions:
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
         split_batch = Mock()
         split_batch.chunked_req = chunked_req
-        split_batch.split_prefill_finished = True
         split_batch.batch_size.side_effect = [1, 0]
         split_batch.is_empty.return_value = True
         running_batch = Mock()
@@ -779,7 +712,7 @@ manual_divisions:
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
         scheduler = SimpleNamespace(
             running_batch=running_batch,
-            split_prefill_batch=split_batch,
+            prefill_batch=split_batch,
             chunked_req=chunked_req,
             process_batch_result=Mock(),
             stash_chunked_request=Mock(),
@@ -815,7 +748,7 @@ manual_divisions:
         prefill_stream, decode_stream, _ = self._make_merge_streams([])
         scheduler = SimpleNamespace(
             running_batch=running_batch,
-            split_prefill_batch=split_batch,
+            prefill_batch=split_batch,
             chunked_req=chunked_req,
             process_batch_result=Mock(),
             stash_chunked_request=Mock(),
@@ -834,13 +767,13 @@ manual_divisions:
             chunked_req_to_exclude=[chunked_req]
         )
 
-    def test_update_split_prefill_batch_processes_pending_chunked_abort(self):
+    def test_update_prefill_batch_processes_pending_chunked_abort(self):
         """PDMux never calls get_next_batch_to_run, so the mixin must drain
         pending chunked aborts itself; without this an aborted chunked request
         leaks its KV forever."""
         running_batch = _Batch(empty=True)
         scheduler = SimpleNamespace(
-            split_prefill_batch=None,
+            prefill_batch=None,
             process_pending_chunked_abort=Mock(),
             get_new_batch_prefill=Mock(
                 return_value=SimpleNamespace(
@@ -849,7 +782,7 @@ manual_divisions:
             ),
         )
 
-        created, returned = SchedulerMultiplexMixin.update_split_prefill_batch(
+        created, returned = SchedulerMultiplexMixin.update_prefill_batch(
             scheduler, 1, running_batch
         )
 
@@ -857,16 +790,16 @@ manual_divisions:
         self.assertFalse(created)
         self.assertIs(returned, running_batch)
 
-    def test_update_split_prefill_batch_defers_abort_while_chunk_in_flight(self):
-        """Tearing down a chunked request while its split forward is running
+    def test_update_prefill_batch_defers_abort_while_chunk_in_flight(self):
+        """Tearing down a chunked request while its token forward is running
         is unsafe; the abort must wait for the between-chunks safe point."""
         running_batch = _Batch(empty=True)
         scheduler = SimpleNamespace(
-            split_prefill_batch=Mock(),
+            prefill_batch=Mock(),
             process_pending_chunked_abort=Mock(),
         )
 
-        created, returned = SchedulerMultiplexMixin.update_split_prefill_batch(
+        created, returned = SchedulerMultiplexMixin.update_prefill_batch(
             scheduler, 1, running_batch
         )
 

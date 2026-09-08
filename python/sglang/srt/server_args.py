@@ -10374,8 +10374,8 @@ class ServerArgs:
             ), "PD-Multiplexing is not compatible with overlap schedule."
             assert cfg.speculative_algorithm in (None, "DSPARK"), (
                 "PD-Multiplexing currently supports speculative decoding only "
-                "with DSPARK; other speculative workers do not implement the "
-                "split-prefill completion contract."
+                "with DSPARK; other speculative workers are not integrated "
+                "with the PDMux scheduler."
             )
 
             if (

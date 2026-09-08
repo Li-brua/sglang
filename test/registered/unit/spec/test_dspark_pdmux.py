@@ -1,8 +1,7 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -10,61 +9,25 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDSparkPDMux(unittest.TestCase):
-    def test_pdmux_rejects_target_without_split_prefill_capture_support(self):
+    def test_pdmux_uses_the_regular_token_chunk_prefill_path(self):
+        batch_output = SimpleNamespace(logits_output=object())
         target_worker = SimpleNamespace(
-            device="cuda",
-            model_runner=SimpleNamespace(model=object()),
-        )
-
-        with (
-            patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2."
-                "get_disagg",
-                return_value=SimpleNamespace(enable_pdmux=True),
-            ),
-            patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2."
-                "get_schedule",
-                return_value=SimpleNamespace(page_size=256),
-            ),
-            self.assertRaisesRegex(
-                NotImplementedError, "preserves DSPARK auxiliary hidden states"
-            ),
-        ):
-            DSparkWorkerV2(
-                server_args=SimpleNamespace(),
-                gpu_id=0,
-                ps=SimpleNamespace(),
-                nccl_port=0,
-                target_worker=target_worker,
-            )
-
-    def test_split_prefill_finalizes_only_after_the_last_segment(self):
-        intermediate = SimpleNamespace(logits_output=None)
-        final = SimpleNamespace(logits_output=object())
-        target_worker = SimpleNamespace(
-            forward_batch_split_prefill=Mock(side_effect=[intermediate, final])
+            forward_batch_generation=Mock(return_value=batch_output)
         )
         worker = object.__new__(DSparkWorkerV2)
         worker._target_worker = target_worker
-        worker._verify_planner = SimpleNamespace(note_non_decode_step=Mock())
-        worker._observers = SimpleNamespace(note_prefill_step=Mock())
         worker._finalize_prefill = Mock(return_value="finalized")
-        batch = SimpleNamespace(split_index=0)
+        batch = SimpleNamespace()
 
-        first = worker.forward_batch_split_prefill(batch)
-        batch.split_index = 1
-        second = worker.forward_batch_split_prefill(batch)
+        result = worker._forward_prefill(batch, on_publish=None)
 
-        self.assertIs(first, intermediate)
-        self.assertEqual(second, "finalized")
-        worker._verify_planner.note_non_decode_step.assert_called_once_with()
-        worker._observers.note_prefill_step.assert_called_once_with()
-        self.assertEqual(
-            target_worker.forward_batch_split_prefill.call_args_list[0].kwargs,
-            {"capture_hidden_mode": CaptureHiddenMode.FULL},
+        self.assertEqual(result, "finalized")
+        target_worker.forward_batch_generation.assert_called_once_with(
+            batch, capture_hidden_mode=unittest.mock.ANY
         )
-        worker._finalize_prefill.assert_called_once_with(batch, final, on_publish=None)
+        worker._finalize_prefill.assert_called_once_with(
+            batch, batch_output, on_publish=None
+        )
 
     def test_stream_switch_updates_target_and_draft_runners(self):
         worker = object.__new__(DSparkWorkerV2)

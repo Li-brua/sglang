@@ -28,7 +28,6 @@ import unittest
 from sglang.test.test_utils import CustomTestCase
 
 from test.manual.pdmux.test_pdmux_hicache import (
-    SPLIT_FORWARD_TOKEN_BUDGET,
     PDMuxHiCacheMixin,
     sm_multiple,
 )
@@ -67,10 +66,6 @@ class DSV4PDMuxHiCacheMixin(PDMuxHiCacheMixin):
         "--trust-remote-code",
         "--tp",
         "8",
-        # PDMux splits by layer rather than by chunk here, matching the
-        # existing DSV4 PDMux sanity run.
-        "--chunked-prefill-size",
-        "-1",
     ]
 
 
@@ -81,7 +76,6 @@ class TestDSV4PDMuxExclusivePartitionsHiCache(DSV4PDMuxHiCacheMixin, CustomTestC
     def pdmux_config_body(cls) -> str:
         return (
             f"sm_group_num: {cls.sm_group_num}\n"
-            f"split_forward_token_budget: {SPLIT_FORWARD_TOKEN_BUDGET}\n"
         )
 
 
@@ -103,14 +97,13 @@ class TestDSV4PDMuxOverlappedMasksHiCache(DSV4PDMuxHiCacheMixin, CustomTestCase)
         )
         return (
             f"sm_group_num: {cls.sm_group_num}\n"
-            f"split_forward_token_budget: {SPLIT_FORWARD_TOKEN_BUDGET}\n"
             "overlap_decode_full_sm: true\n"
             f"manual_divisions:\n{entries}"
         )
 
 
 class TestDSV4PDMuxDSparkHiCache(DSV4PDMuxHiCacheMixin, CustomTestCase):
-    """DSV4 split prefill feeds DSpark while HiCache backs both KV pools."""
+    """DSV4 token-chunk prefill feeds DSpark with HiCache enabled."""
 
     model_path = DSV4_DSPARK_MODEL_PATH
     extra_server_args = [
@@ -123,7 +116,6 @@ class TestDSV4PDMuxDSparkHiCache(DSV4PDMuxHiCacheMixin, CustomTestCase):
     def pdmux_config_body(cls) -> str:
         return (
             f"sm_group_num: {cls.sm_group_num}\n"
-            f"split_forward_token_budget: {SPLIT_FORWARD_TOKEN_BUDGET}\n"
         )
 
 

@@ -3,13 +3,13 @@
 The pump (`Scheduler.check_hicache_events_if_enabled`) drains HiCache
 transfer acks, releases host-side write locks, and advances storage prefetch
 progress. In the normal event loop it rides along with batch formation, which
-runs every iteration. PDMux forms a batch only when no split prefill is in
-flight, so the pump needs explicit coverage for the iterations where formation
-is skipped.
+runs every iteration. PDMux forms a batch only when no token-chunk prefill is
+in flight, so the pump needs explicit coverage for the iterations where
+formation is skipped.
 
 Both halves of the call pattern matter:
 
-- Too few pumps starve HiCache for the whole duration of a long split prefill.
+- Too few pumps starve HiCache for the whole duration of a long prefill.
 - Too many desync the pump's collective all-reduces across TP ranks, which
   deadlocks rather than degrades.
 """
@@ -59,7 +59,7 @@ class _Stream:
 
 
 class _DecodeBatch:
-    """A non-empty decode batch, so split prefill advances one layer at a time."""
+    """A non-empty decode batch for the overlapped token-chunk prefill."""
 
     batch_is_full = False
 
@@ -78,12 +78,9 @@ class _EmptyDecodeBatch(_DecodeBatch):
         return True
 
 
-class _SplitBatch:
+class _TokenChunkBatch:
     def __init__(self):
-        self.split_index = 0
         self.extend_num_tokens = 1000
-        self.split_forward_count = 0
-        self.split_prefill_finished = False
         self.chunked_req = None
         self.forward_mode = None
         self.hicache_consumer_index = CONSUMER_INDEX
@@ -107,12 +104,11 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.max_iterations = max_iterations
         self.iteration = -1
         self.pumps = []
-        self.split_forward_consumer_indices = []
+        self.prefill_consumer_indices = []
         self.HICACHE_PUMP_INTERVAL = pump_interval
 
         self.model_config = SimpleNamespace(num_hidden_layers=NUM_LAYERS)
         self.pdmux_config = SimpleNamespace(
-            split_forward_token_budget=1000,
             manual_divisions=[],
             decode_bs_divisor=36,
         )
@@ -122,9 +118,9 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         )
         self.tree_cache = Mock()
         self.chunked_req = None
-        self.split_prefill_batch = None
+        self.prefill_batch = None
         self.running_batch = _EmptyDecodeBatch() if decode_empty else _DecodeBatch()
-        self.pending_split_batch = _SplitBatch()
+        self.pending_prefill_batch = _TokenChunkBatch()
 
         stream = _Stream(query_results)
         self.stream_groups = [(stream, stream)]
@@ -150,7 +146,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         # Stands in for `_get_new_batch_prefill_raw`, whose first act is to pump
         # HiCache events. Formation admits one request, then finds none.
         self.check_hicache_events_if_enabled()
-        batch, self.pending_split_batch = self.pending_split_batch, None
+        batch, self.pending_prefill_batch = self.pending_prefill_batch, None
         return SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
 
     def update_running_batch(self, running_batch):
@@ -168,8 +164,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         return 0
 
     def run_batch(self, batch):
-        if batch is self.split_prefill_batch:
-            self.split_forward_consumer_indices.append(batch.hicache_consumer_index)
+        if batch is self.prefill_batch:
+            self.prefill_consumer_indices.append(batch.hicache_consumer_index)
         return object()
 
     def process_batch_result(self, batch, result):
@@ -224,11 +220,9 @@ class TestPDMuxHiCacheEvents(unittest.TestCase):
     def test_every_iteration_pumps_hicache_events_exactly_once(self):
         """At interval 1, one pump per iteration across all formation states.
 
-        With three layers and a busy decode batch the loop walks: iteration 0
-        forms the batch (pump rides along with formation), iterations 1-2 have a
-        split prefill in flight (formation is skipped), and iteration 3 waits for
-        the prefill kernel to retire (formation is not even attempted). Only the
-        first is covered by the formation path.
+        Iteration 0 forms the token chunk (pump rides along with formation),
+        iteration 1 waits for the prefill kernel to retire, and later iterations
+        form no work. Only the first is covered by the formation path.
         """
         # The finish event reports not-ready once, so the loop spends iteration 3
         # in `wait_prefill_kernel_done` before merging.
@@ -236,22 +230,15 @@ class TestPDMuxHiCacheEvents(unittest.TestCase):
 
         self.assertEqual(scheduler.pumps, [0, 1, 2, 3])
 
-    def test_split_prefill_forwards_keep_one_hicache_consumer_index(self):
-        """Every layer segment must still carry the batch's consumer index.
+    def test_token_chunk_prefill_keeps_one_hicache_consumer_index(self):
+        """The complete token chunk carries the batch's consumer index.
 
-        The index selects which layer-transfer event set the model waits on
-        before reading loaded-back KV. This case only guards the ScheduleBatch
-        field surviving across segments; the worker actually installing it per
-        segment (`set_hicache_consumer`, which decode resets to -1 in between)
-        is guarded by test_pdmux_scheduler.py's
-        test_split_prefill_forward_installs_hicache_consumer_first.
+        The index selects which transfer event set the model waits on before
+        reading loaded-back KV.
         """
         scheduler = _run_loop(max_iterations=4, query_results=[False])
 
-        self.assertEqual(
-            scheduler.split_forward_consumer_indices,
-            [CONSUMER_INDEX] * NUM_LAYERS,
-        )
+        self.assertEqual(scheduler.prefill_consumer_indices, [CONSUMER_INDEX])
 
     def test_pump_still_runs_when_prefill_finishes_without_waiting(self):
         """The finish event may already be ready when the merge check runs, so

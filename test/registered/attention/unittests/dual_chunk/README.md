@@ -64,7 +64,7 @@ See `KNOWN_FAILURES.md` §1 for the full root cause + fix.
   `dual_chunk_flashattention_backend.py:179` asserts
   `forward_mode.is_prefill() or forward_mode.is_decode()`. `is_prefill()`
   aliases to `is_extend()` (`forward_batch_info.py:103-104`) and covers
-  `EXTEND` / `MIXED` / `DRAFT_EXTEND` / `TARGET_VERIFY` / `SPLIT_PREFILL` /
+  `EXTEND` / `MIXED` / `DRAFT_EXTEND` / `TARGET_VERIFY` /
   `DLLM_EXTEND`, but `DRAFT_EXTEND_V2` is excluded by default. So
   `DRAFT_EXTEND_V2` is structurally unreachable for `dual_chunk_flash_attn`.
 - **Non-causal / windowed-attention requests** — `forward_extend` raises

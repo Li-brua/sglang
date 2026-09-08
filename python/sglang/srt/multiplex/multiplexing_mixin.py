@@ -12,7 +12,6 @@ import torch.distributed as dist
 from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import set_pdmux_status
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
     get_sm_counts,
@@ -33,8 +32,9 @@ logger = logging.getLogger(__name__)
 
 class SchedulerMultiplexMixin:
     def init_pdmux(self: Scheduler):
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
+        # The current token-chunk prefill batch. PDMux overlaps this ordinary
+        # EXTEND forward with decode; it does not split the model by layer.
+        self.prefill_batch: Optional[ScheduleBatch] = None
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(
@@ -61,7 +61,7 @@ class SchedulerMultiplexMixin:
         balanced) partition.  The range is intentionally allowed to continue
         into decode-majority partitions for larger batches.
         """
-        if not running_batch.is_empty() and self.split_prefill_batch:
+        if not running_batch.is_empty() and self.prefill_batch:
             decode_bs = running_batch.batch_size()
             manual_divisions = self.pdmux_config.manual_divisions
             if manual_divisions:
@@ -113,15 +113,15 @@ class SchedulerMultiplexMixin:
             self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
-    def update_split_prefill_batch(
+    def update_prefill_batch(
         self: Scheduler, sm_count: int, running_batch: ScheduleBatch
     ) -> tuple[bool, ScheduleBatch]:
-        if self.split_prefill_batch:
+        if self.prefill_batch:
             return False, running_batch
 
-        # No split forward is in flight here, which matches the normal loop's
-        # "top of the scheduling step" safe point for tearing down an aborted
-        # chunked request before its next chunk is formed.
+        # No token chunk forward is in flight here, which matches the normal
+        # loop's safe point for tearing down an aborted request before its next
+        # chunk is formed.
         self.process_pending_chunked_abort()
 
         # add new request
@@ -129,62 +129,9 @@ class SchedulerMultiplexMixin:
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         if batch and not batch.is_empty():
-            batch.forward_mode = (
-                ForwardMode.SPLIT_PREFILL
-            )  # Set forward mode for split prefill
-            self.split_prefill_batch = batch
+            self.prefill_batch = batch
             return True, running_batch
         return False, running_batch
-
-    def _get_split_forward_count(
-        self: Scheduler,
-        prefill_sm_count: Optional[int] = None,
-        decode_sm_count: Optional[int] = None,
-    ) -> int:
-        remaining_layers = (
-            self.model_config.num_hidden_layers - self.split_prefill_batch.split_index
-        )
-
-        # Splitting only benefits decode work that can run between prefill
-        # intervals. Without decode work, finish prefill in one model call to
-        # avoid repeating the full scheduler/model-runner setup per layer.
-        if self.running_batch is None or self.running_batch.is_empty():
-            return remaining_layers
-
-        if self.split_prefill_batch.extend_num_tokens <= 0:
-            return remaining_layers
-
-        forward_count = max(
-            1,
-            self.pdmux_config.split_forward_token_budget
-            // self.split_prefill_batch.extend_num_tokens,
-        )
-
-        # A very small configured segment can finish well before the concurrent
-        # decode step, leaving the exclusive prefill partition idle until the
-        # scheduler consumes the decode result. Use a rank-stable token-layer
-        # estimate to keep at least one decode step's proportional work queued.
-        # Do not apply it when decode uses the full device: those streams overlap
-        # the prefill mask and a longer prefill queue would increase contention.
-        if (
-            prefill_sm_count
-            and decode_sm_count
-            and not getattr(self.pdmux_config, "overlap_decode_full_sm", False)
-        ):
-            proportional_work = (
-                self.running_batch.batch_size()
-                * self.model_config.num_hidden_layers
-                * prefill_sm_count
-            )
-            proportional_work = (
-                proportional_work + decode_sm_count - 1
-            ) // decode_sm_count
-            proportional_layers = (
-                proportional_work + self.split_prefill_batch.extend_num_tokens - 1
-            ) // self.split_prefill_batch.extend_num_tokens
-            forward_count = max(forward_count, proportional_layers)
-
-        return min(forward_count, remaining_layers)
 
     def init_pdmux_prefill_plan_limit(
         self: Scheduler, attn_backend: AttentionBackend
@@ -270,7 +217,7 @@ class SchedulerMultiplexMixin:
         decode_stream,
         running_batch: ScheduleBatch,
     ) -> ScheduleBatch:
-        batch = self.split_prefill_batch
+        batch = self.prefill_batch
         self.process_batch_result(batch, prefill_result)
 
         # Mirror get_next_batch_to_run's chunked bookkeeping: a request that
@@ -284,10 +231,6 @@ class SchedulerMultiplexMixin:
             # already cached. A parked chunk (add_chunked_req hybrid-SWA
             # early-return) has nothing new to cache.
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
-                # The stash rewrites the request's req_to_token row, which the
-                # sparse-prefill scaffolding cache snapshots at segment 0, so
-                # it is only legal once every split segment has run.
-                assert batch.split_prefill_finished
                 self.stash_chunked_request(self.chunked_req)
         if batch.chunked_req is not None:
             chunked_req_to_exclude.add(batch.chunked_req)
@@ -309,7 +252,7 @@ class SchedulerMultiplexMixin:
                 running_batch = batch
 
         self.running_batch = running_batch
-        self.split_prefill_batch = None
+        self.prefill_batch = None
 
         # merge_batch and the chunk stash enqueue tensor work (concatenations,
         # radix-cache inserts, page frees) on the prefill stream. The next loop
@@ -357,7 +300,7 @@ class SchedulerMultiplexMixin:
                 sm_count = self.sm_counts[stream_idx][0]
                 formation_done = None
                 # Batch formation is the only other caller of the HiCache pump,
-                # and it is skipped for every iteration a split prefill occupies
+                # and it is skipped for every iteration a token-chunk prefill occupies
                 # -- which is most of them under the long prefills PDMux exists
                 # to overlap. Pump exactly on those iterations: skipping starves
                 # HiCache of ack processing and host-lock release for the whole
@@ -368,25 +311,25 @@ class SchedulerMultiplexMixin:
                 # it needs the same dependency publication as batch formation
                 # -- decode allocates from that free list and the decode graph
                 # re-reads the mapping on replay.
-                had_inflight_split = self.split_prefill_batch is not None
-                if wait_prefill_kernel_done or had_inflight_split:
+                had_inflight_prefill = self.prefill_batch is not None
+                if wait_prefill_kernel_done or had_inflight_prefill:
                     self._hicache_pump_tick += 1
                     if self._hicache_pump_tick % self.HICACHE_PUMP_INTERVAL == 0:
                         # Publish a dependency only when the pump reports it
                         # may have enqueued device work (write_back frees,
                         # storage-queue actions): an event recorded here lands
-                        # after the in-flight split segments and serializes
+                        # after the in-flight prefill and serializes
                         # decode behind the whole prefill's completion, so a
                         # host-only ack drain must not pay it.
                         if self.check_hicache_events_if_enabled():
                             formation_done = prefill_stream.record_event()
                 if not wait_prefill_kernel_done:
-                    created, running_batch = self.update_split_prefill_batch(
+                    created, running_batch = self.update_prefill_batch(
                         sm_count, running_batch=running_batch
                     )
                     self.running_batch = running_batch
                     adjust_stream_group = created or adjust_stream_group
-                    if not had_inflight_split:
+                    if not had_inflight_prefill:
                         # Batch formation enqueued radix-cache and allocator
                         # work (prefix-match concatenations, evictions, KV
                         # allocation) on the prefill stream, rebinding the
@@ -395,7 +338,7 @@ class SchedulerMultiplexMixin:
                         # next step. Record ONLY when formation actually ran
                         # (or the pump above enqueued device work): an event
                         # recorded on an idle iteration lands after the
-                        # in-flight split segments and serializes every decode
+                        # in-flight prefill and serializes every decode
                         # step behind the whole prefill's completion -- a
                         # ~50% TPOT regression under prefill-heavy load, for
                         # no ordering benefit.
@@ -410,7 +353,7 @@ class SchedulerMultiplexMixin:
                 adjust_stream_group = adjust_stream_group or (
                     stream_idx > 0 and running_batch.is_empty()
                 )
-                if running_batch.is_empty() and self.split_prefill_batch is None:
+                if running_batch.is_empty() and self.prefill_batch is None:
                     self.on_idle()
 
             if adjust_stream_group:
@@ -437,29 +380,17 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 if (
-                    self.split_prefill_batch
-                    and not self.split_prefill_batch.is_empty()
+                    self.prefill_batch
+                    and not self.prefill_batch.is_empty()
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
-                    forward_count = self._get_split_forward_count(
-                        prefill_sm_count=self.sm_counts[stream_idx][0],
-                        decode_sm_count=self.sm_counts[stream_idx][1],
-                    )
-                    next_split_index = min(
-                        self.split_prefill_batch.split_index + forward_count,
-                        self.model_config.num_hidden_layers,
-                    )
-                    forward_count = (
-                        next_split_index - self.split_prefill_batch.split_index
-                    )
-
-                    self.split_prefill_batch.split_forward_count = forward_count
-                    prefill_result = self.run_batch(self.split_prefill_batch)
-                    if next_split_index == self.model_config.num_hidden_layers:
-                        self.split_prefill_batch.split_prefill_finished = True
-                        prefill_exe_done = prefill_stream.record_event()
-                    self.split_prefill_batch.split_index = next_split_index
+                    # ``get_new_batch_prefill`` already applies the configured
+                    # token chunk limit. Run that ordinary EXTEND batch through
+                    # all model layers in one forward; PDMux only overlaps the
+                    # resulting prefill work with decode on separate streams.
+                    prefill_result = self.run_batch(self.prefill_batch)
+                    prefill_exe_done = prefill_stream.record_event()
 
                 elif wait_prefill_kernel_done:
                     prefill_done = True
@@ -474,7 +405,7 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
-                if prefill_done and self.split_prefill_batch.split_prefill_finished:
+                if prefill_done:
                     wait_prefill_kernel_done = True
                     prefill_exe_done_flag = prefill_exe_done.query()
                     flags = (

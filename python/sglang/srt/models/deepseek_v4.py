@@ -3333,8 +3333,6 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
-    supports_pdmux_dspark_prefill = True
-
     def __init__(
         self,
         config: DeepSeekV4Config,

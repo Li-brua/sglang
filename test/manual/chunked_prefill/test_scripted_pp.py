@@ -182,7 +182,7 @@ class TestPPPdmux(ScriptedTestCase):
         ), "engine died before req finished — merge_batch assert may have tripped"
         assert r.chunks_done >= 2, (
             f"pdmux + chunked path must produce >=2 chunks to exercise "
-            f"split_prefill_batch filter; got chunks_done={r.chunks_done}"
+            f"chunked prefill filter; got chunks_done={r.chunks_done}"
         )
 
 

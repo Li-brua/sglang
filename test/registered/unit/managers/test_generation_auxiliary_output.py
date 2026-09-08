@@ -377,17 +377,14 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     scheduler.device_module.Event.assert_not_called()
 
 
-def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
+def test_pdmux_token_chunk_prefill_schedules_auxiliary_output_copy():
     device_output = DeviceOutput(torch.tensor([1.0]))
-    next_draft_input = object()
     result = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
             next_token_logits=None,
             auxiliary_device_output=device_output,
         ),
-        next_token_ids=torch.tensor([7]),
-        next_draft_input=next_draft_input,
-        new_seq_lens=torch.tensor([5]),
+        next_token_ids=None,
     )
     copy_done = CopyDone()
     scheduler = object.__new__(Scheduler)
@@ -401,25 +398,22 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     scheduler.enable_overlap = False
     scheduler.enable_pdmux = True
     scheduler.ps = SimpleNamespace(pp_size=1)
-    scheduler.tp_worker = SimpleNamespace()
     scheduler.model_worker = SimpleNamespace(
-        forward_batch_split_prefill=Mock(return_value=result)
+        forward_batch_generation=Mock(return_value=result)
     )
     scheduler.future_map = object()
     scheduler._relay_forward_payload = Mock()
+    scheduler.update_cache_from_scheduler = Mock()
     scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
     scheduler.enable_dp_attention = False
     batch = SimpleNamespace(
         forward_mode=SimpleNamespace(
             is_prebuilt=lambda: False,
-            is_split_prefill=lambda: True,
+            is_extend=lambda: True,
         ),
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
         reqs=[],
         req_pool_indices=torch.tensor([3]),
-        seq_lens=torch.tensor([4]),
-        seq_lens_cpu=torch.tensor([4]),
-        seq_lens_sum=4,
-        spec_info=None,
         input_ids=torch.tensor([5]),
         return_logprob=False,
         return_hidden_states=False,
@@ -432,11 +426,10 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
 
     resolve_forward_inputs.assert_called_once_with(batch, scheduler.future_map)
     assert output_result is result
-    scheduler.model_worker.forward_batch_split_prefill.assert_called_once_with(batch)
-    assert batch.spec_info is next_draft_input
-    assert batch.seq_lens.tolist() == [5]
-    assert batch.seq_lens_cpu.tolist() == [5]
-    scheduler._relay_forward_payload.assert_not_called()
+    scheduler.model_worker.forward_batch_generation.assert_called_once_with(
+        batch, pp_proxy_tensors=None
+    )
+    scheduler.update_cache_from_scheduler.assert_called_once_with(batch, result)
     assert result.auxiliary_host_output.values.tolist() == [1.0]
     assert copy_done.record_count == 1
 

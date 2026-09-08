@@ -10,12 +10,11 @@ only in how the prefill and decode streams are masked:
   - overlapped masks (`overlap_decode_full_sm`: decode runs on the full device)
 
 The server is deliberately configured to make the HiCache paths run rather than
-sit idle: a small device KV pool forces eviction to host, `write_through` backs
-every finished request up, and a small `split_forward_token_budget` makes each
-prefill split per layer so it spans many scheduler iterations.
+sit idle: a small device KV pool forces eviction to host and `write_through`
+backs every finished request up while token chunks overlap decode.
 
 The scheduler-loop property HiCache depends on -- that transfer acks are
-drained exactly once per iteration, including the iterations a split prefill
+drained exactly once per iteration, including the iterations a token chunk
 occupies -- is pinned deterministically in
 test/registered/unit/multiplex/test_pdmux_hicache_events.py. These tests check
 the end-to-end consequences: correct output after a host reload, and acks that
@@ -44,10 +43,9 @@ from sglang.test.test_utils import (
 LOAD_BACK_TOKENS = "sglang:load_back_tokens_total"
 BACKUP_TOKENS = "sglang:hicache_backup_tokens_total"
 
-# Long enough that a prefill splits per layer at the budget below, so a single
-# request occupies many scheduler iterations alongside decode.
+# The request is large enough to exercise token-chunk prefill while it overlaps
+# with decode.
 PROMPT_LEN = 2048
-SPLIT_FORWARD_TOKEN_BUDGET = 512
 
 # Device KV pool, in tokens. Small on purpose: several of these prompts do not
 # fit at once, which is what pushes evicted pages to host.
@@ -125,6 +123,8 @@ class PDMuxHiCacheMixin:
                 # raises); --hicache-ratio is the portable knob.
                 "--hicache-ratio",
                 "2",
+                "--chunked-prefill-size",
+                "512",
                 "--max-total-tokens",
                 str(cls.max_total_tokens),
                 "--mem-fraction-static",
@@ -215,10 +215,10 @@ class PDMuxHiCacheMixin:
         self.assertEqual(warm["output_ids"], cold["output_ids"])
 
     def test_backups_keep_draining_under_overlapped_long_prefills(self):
-        """Transfer acks must keep retiring while split prefills are in flight.
+        """Transfer acks must keep retiring while token chunks are in flight.
 
         HiCache write acks are drained by the scheduler loop, and PDMux spends
-        most of its iterations inside a split prefill. Long prefills running
+        most of its iterations inside a token chunk. Long prefills running
         concurrently with decode must not freeze the backup counter -- if they
         did, host pages would stay pinned for the whole prefill and the pool
         would eventually stall.
@@ -251,7 +251,6 @@ class TestPDMuxExclusivePartitionsHiCache(PDMuxHiCacheMixin, CustomTestCase):
     def pdmux_config_body(cls) -> str:
         return (
             f"sm_group_num: {cls.sm_group_num}\n"
-            f"split_forward_token_budget: {SPLIT_FORWARD_TOKEN_BUDGET}\n"
         )
 
 
@@ -277,7 +276,6 @@ class TestPDMuxOverlappedMasksHiCache(PDMuxHiCacheMixin, CustomTestCase):
         )
         return (
             f"sm_group_num: {cls.sm_group_num}\n"
-            f"split_forward_token_budget: {SPLIT_FORWARD_TOKEN_BUDGET}\n"
             "overlap_decode_full_sm: true\n"
             f"manual_divisions:\n{entries}"
         )

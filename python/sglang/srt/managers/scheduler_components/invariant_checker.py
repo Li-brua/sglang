@@ -462,10 +462,18 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
+        # Unified/hybrid cache sanity_check walks the complete radix tree in
+        # Python. Large long-context caches can take minutes and block the only
+        # scheduler thread, so keep this diagnostic explicitly opt-in.
+        if not envs.SGLANG_CHECK_TREE_CACHE_INVARIANTS.get():
+            return
+
         if (
             self.tree_cache.is_tree_cache()
-            and (self.is_hybrid_swa and self.tree_cache.supports_swa())
-            or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
+            and (
+                (self.is_hybrid_swa and self.tree_cache.supports_swa())
+                or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
+            )
         ):
             self.tree_cache.sanity_check()
 

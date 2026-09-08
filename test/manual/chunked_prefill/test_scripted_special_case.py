@@ -207,14 +207,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             saw_r1_chunking
         ), "r1 must have chunked at some point to exercise the exclude branch"
 
-    @unittest.skip(
-        "pdmux split_prefill_batch requires the pdmux topology — "
-        "single-engine ScriptedContext cannot drive the split path. "
-        "Belongs in a pdmux-specific test once that lane is wired up."
-    )
-    def test_pdmux_split_prefill_batch(self):
-        pass
-
     def test_streaming_session_kv_committed_bound(self):
         self.server.execute_script(self._script_streaming_session_kv_committed_bound)
 
