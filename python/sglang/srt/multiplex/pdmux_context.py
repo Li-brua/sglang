@@ -28,6 +28,23 @@ class PDMuxConfig:
     decode_bs_divisor: int = 36
 
 
+def decode_lane_attn_backend(model_runner):
+    """The backend for decode-lane work that a caller plans before the forward.
+
+    TARGET_VERIFY is classified as an extend mode but runs on the decode lane,
+    between draft steps. Under PDMux it must plan into the per-stream decode
+    backend the eager runner will resolve for it: the prefill instance may be
+    serving an in-flight prefill on the other stream, and both write their
+    forward metadata and scratch buffers in place. Without PDMux there is one
+    backend and this is the runner default, which is what those paths used.
+    """
+    from sglang.srt.distributed.parallel_state import is_pdmux_enabled
+
+    if is_pdmux_enabled():
+        return model_runner.decode_attn_backend
+    return model_runner.attn_backend
+
+
 def load_pdmux_config(
     config_path: str, default_sm_group_num: int = SM_GROUP_NUM
 ) -> PDMuxConfig:

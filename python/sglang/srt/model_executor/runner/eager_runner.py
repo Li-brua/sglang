@@ -57,6 +57,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
+from sglang.srt.multiplex.pdmux_context import decode_lane_attn_backend
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -240,6 +241,22 @@ class EagerRunner(BaseRunner):
             )
         return model_runner.attn_backend, contextlib.nullcontext()
 
+    def _resolve_extend_pdmux(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[Any, contextlib.AbstractContextManager]:
+        """Resolve the backend an eager EXTEND-family forward runs under.
+
+        TARGET_VERIFY is classified as an extend mode but belongs to the decode
+        lane: it runs between draft steps on the decode stream. Under PDMux it
+        must therefore use the decode lane's per-stream backend, not the prefill
+        instance -- both write `forward_metadata` and the same scratch buffers in
+        place, and a prefill can be in flight on the other stream. A real prefill
+        keeps the prefill backend and the ambient context.
+        """
+        if self.enable_pdmux and forward_batch.forward_mode.is_target_verify():
+            return self._resolve_decode_pdmux()
+        return self.model_runner.attn_backend, contextlib.nullcontext()
+
     def _execute_decode(
         self,
         forward_batch: ForwardBatch,
@@ -276,6 +293,7 @@ class EagerRunner(BaseRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
+        attn_backend, pdmux_ctx = self._resolve_extend_pdmux(forward_batch)
 
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -318,8 +336,8 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
-            model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
+            attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch,
                 num_qo_tokens=len(forward_batch.input_ids),
             )
@@ -337,7 +355,7 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
+        with device_timer_ctx(model_runner.device_timer, category), pdmux_ctx:
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip
@@ -447,12 +465,17 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
+        # An idle batch is decode-lane work (DP-attn MLP sync), so it must plan
+        # into -- and clear -- the decode lane's per-stream backend. Touching the
+        # prefill instance here would rewrite or null the forward_metadata of a
+        # prefill that may be in flight on the other stream.
+        idle_attn_backend = decode_lane_attn_backend(model_runner)
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            idle_attn_backend.init_forward_metadata(forward_batch)
         else:
-            model_runner.attn_backend.forward_metadata = None
+            idle_attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
         with device_timer_ctx(model_runner.device_timer, "idle"):

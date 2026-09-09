@@ -41,6 +41,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -2746,7 +2747,13 @@ class DeepseekV4Model(nn.Module):
                 )
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
-        )
+        ) and not is_pdmux_enabled()
+        # PDMux runs prefill and decode concurrently on two green-context
+        # streams. These helper streams are created on the plain context, so work
+        # forked onto them is not placed by the lane that forked it. Leaving them
+        # unset routes the attention KV / compressor / indexer split, the
+        # indexer's internal split and the MoE shared-expert branch onto the
+        # already-supported single-stream path.
         device_module = torch.get_device_module()
         num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
         self.alt_streams = (

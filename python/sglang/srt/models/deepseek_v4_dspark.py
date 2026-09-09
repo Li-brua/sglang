@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -717,6 +718,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
             and torch.cuda.is_available()
+            # Created on the plain context, so work forked onto it is not placed
+            # by the PDMux lane that forked it. See the same gate in
+            # DeepseekV4Model.
+            and not is_pdmux_enabled()
         )
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
             [torch.cuda.Stream()] if use_multi_stream else None

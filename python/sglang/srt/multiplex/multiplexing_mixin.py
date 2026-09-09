@@ -5,7 +5,7 @@ Mixin class providing multiplexing scheduling logic
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -35,6 +35,18 @@ class SchedulerMultiplexMixin:
         # The current token-chunk prefill batch. PDMux overlaps this ordinary
         # EXTEND forward with decode; it does not split the model by layer.
         self.prefill_batch: Optional[ScheduleBatch] = None
+        # Identity marker for the work item currently being submitted through
+        # run_batch (see `_submit_pdmux_prefill`). Set only around that call so a
+        # batch that becomes the decode batch is never mistaken for a prefill.
+        self._pdmux_prefill_batch: Optional[ScheduleBatch] = None
+        # Pipelined completion state for the in-flight prefill: the result and
+        # its exe-done event while the work item is tracked, plus the one vote
+        # outstanding (issued one iteration, consumed the next). See
+        # `_advance_pdmux_prefill`.
+        self._pdmux_prefill_result = None
+        self._pdmux_prefill_exe_done = None
+        self._pdmux_prefill_done_vote = None
+        self._pdmux_prefill_done_flags = None
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(
@@ -48,6 +60,91 @@ class SchedulerMultiplexMixin:
         logger.info(
             f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
         )
+
+    def pdmux_inflight_prefill_batches(self: Scheduler) -> List[ScheduleBatch]:
+        """The prefill batch that lives outside running_batch / last_batch.
+
+        Between formation and merge the loop holds the prefill batch in its own
+        field, so callers enumerating in-flight work would otherwise miss it:
+        `abort_request` would not see those requests until they reach the decode
+        batch, and `is_fully_idle` would call the scheduler idle while a prefill
+        forward is still running -- which lets flush_cache reset the tree cache
+        and the request / KV pools underneath it. Empty unless PDMux is on, since
+        `prefill_batch` is only created by init_pdmux.
+        """
+        if not self.enable_pdmux or self.prefill_batch is None:
+            return []
+        return [self.prefill_batch]
+
+    def _submit_pdmux_prefill(self: Scheduler, batch: ScheduleBatch):
+        """Submit the PDMux prefill forward.
+
+        `self._pdmux_prefill_batch` marks the single run_batch call that submits
+        the prefill, so run_batch can pin the forward's tensor lifetime onto the
+        result: the prefill stream runs on for many decode iterations before the
+        merge, and run_batch rebinds the batch's input_ids / seq_lens / spec_info
+        as it returns. A snapshot taken inside run_batch after resolve_forward_inputs
+        is what keeps the tensors the forward read alive across that rebind; it
+        rides on the result's extra_keep_alive_refs, so the loop holding the
+        result until the merge vote pins it for exactly that span.
+        """
+        assert self._pdmux_prefill_batch is None, "a PDMux prefill is already tracked"
+        self._pdmux_prefill_batch = batch
+        try:
+            return self.run_batch(batch)
+        finally:
+            self._pdmux_prefill_batch = None
+
+    def _issue_pdmux_done_vote(self: Scheduler) -> None:
+        """Sample this iteration's completion flag and start the allreduce."""
+        flags = torch.zeros(1, device="cpu", dtype=torch.int32)
+        if self._pdmux_prefill_exe_done.query():
+            flags[0] = 1
+        self._pdmux_prefill_done_flags = flags
+        self._pdmux_prefill_done_vote = self.tp_cpu_group.allreduce(
+            flags, dist.ReduceOp.SUM
+        )
+
+    def _advance_pdmux_prefill(
+        self: Scheduler,
+        *,
+        running_batch: ScheduleBatch,
+        prefill_stream,
+        decode_stream,
+    ) -> tuple[ScheduleBatch, bool]:
+        """One completion-pipeline step for the in-flight prefill.
+
+        Consumes the vote issued last iteration, then issues this iteration's
+        fresh vote, so the collective started here is waited on at the top of the
+        next step -- it gets a full iteration of host work (decode submit and its
+        result processing) to land in the background. HEAD issued and waited the
+        allreduce back to back, paying the rendezvous latency inline on every
+        iteration a long prefill spans.
+
+        Every rank consumes the same collectives on the same iterations and votes
+        under the same `wait_prefill_kernel_done` condition, so a rank whose event
+        is ready an iteration early just votes 1 until stragglers catch up -- the
+        reduced sum is the only decision input and no rank can finalize on a
+        different iteration. A new flag tensor each vote: the previous one may
+        still be owned by the Work waited on above. Returns (running_batch, merged).
+        """
+        if self._pdmux_prefill_done_vote is not None:
+            # Consume last iteration's vote.
+            self._pdmux_prefill_done_vote.wait()
+            self._pdmux_prefill_done_vote = None
+            if self._pdmux_prefill_done_flags.item() == self.ps.tp_size:
+                running_batch = self._merge_finished_prefill_batch(
+                    self._pdmux_prefill_result,
+                    prefill_stream,
+                    decode_stream,
+                    running_batch,
+                )
+                self._pdmux_prefill_result = None
+                self._pdmux_prefill_exe_done = None
+                return running_batch, True
+
+        self._issue_pdmux_done_vote()
+        return running_batch, False
 
     # TODO(jason-fxz): This is a temporary demo
     def _select_stream_idx(self: Scheduler, running_batch: ScheduleBatch) -> int:
@@ -276,7 +373,6 @@ class SchedulerMultiplexMixin:
     def event_loop_pdmux(self: Scheduler):
         """A scheduler loop for pd multiplexing."""
         decode_done = False
-        prefill_done = False
         wait_prefill_kernel_done = False
         adjust_stream_group = False
         self._hicache_pump_tick = 0
@@ -384,18 +480,15 @@ class SchedulerMultiplexMixin:
                     and not self.prefill_batch.is_empty()
                     and not wait_prefill_kernel_done
                 ):
-                    prefill_done = True
                     # ``get_new_batch_prefill`` already applies the configured
                     # token chunk limit. Run that ordinary EXTEND batch through
                     # all model layers in one forward; PDMux only overlaps the
                     # resulting prefill work with decode on separate streams.
-                    prefill_result = self.run_batch(self.prefill_batch)
-                    prefill_exe_done = prefill_stream.record_event()
-
-                elif wait_prefill_kernel_done:
-                    prefill_done = True
-                else:
-                    prefill_done = False
+                    wait_prefill_kernel_done = True
+                    self._pdmux_prefill_result = self._submit_pdmux_prefill(
+                        self.prefill_batch
+                    )
+                    self._pdmux_prefill_exe_done = prefill_stream.record_event()
 
             if decode_done:
                 decode_stream.synchronize()
@@ -405,22 +498,15 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
-                if prefill_done:
-                    wait_prefill_kernel_done = True
-                    prefill_exe_done_flag = prefill_exe_done.query()
-                    flags = (
-                        torch.ones(1, device="cpu", dtype=torch.int32)
-                        if prefill_exe_done_flag
-                        else torch.zeros(1, device="cpu", dtype=torch.int32)
+                if wait_prefill_kernel_done:
+                    # Runs every iteration a prefill is tracked, including the
+                    # submission iteration (issues the first vote). One vote per
+                    # iteration, consumed at the top of the next one.
+                    running_batch, merged = self._advance_pdmux_prefill(
+                        running_batch=running_batch,
+                        prefill_stream=prefill_stream,
+                        decode_stream=decode_stream,
                     )
-
-                    self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                    if flags.item() == self.ps.tp_size:
-                        running_batch = self._merge_finished_prefill_batch(
-                            prefill_result,
-                            prefill_stream,
-                            decode_stream,
-                            running_batch,
-                        )
+                    if merged:
                         wait_prefill_kernel_done = False
                         adjust_stream_group = True

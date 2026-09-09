@@ -3836,6 +3836,35 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _pdmux_keep_alive_if_submitting(
+        self, batch: ScheduleBatch
+    ) -> Optional[List[Any]]:
+        """Snapshot a PDMux prefill's forward inputs, or None for any other batch.
+
+        A PDMux prefill outlives its run_batch call on the host: the prefill
+        stream keeps running for many decode iterations before the merge, while
+        run_batch rebinds input_ids / seq_lens / spec_info as it returns. Taken
+        right after resolve_forward_inputs, this pins the exact tensors the
+        forward reads so the result can keep them alive until the merge. Decode
+        batches and non-PDMux forwards return None and pay nothing.
+        """
+        if not self.enable_pdmux or batch is not self._pdmux_prefill_batch:
+            return None
+        return [
+            batch,
+            [getattr(batch, f.name, None) for f in dataclasses.fields(batch)],
+        ]
+
+    def _pdmux_attach_keep_alive(
+        self, batch_result: GenerationBatchResult, keep_alive: Optional[List[Any]]
+    ) -> None:
+        """Ride the prefill snapshot on the result until the merge consumes it."""
+        if keep_alive is None:
+            return
+        if batch_result.extra_keep_alive_refs:
+            keep_alive.extend(batch_result.extra_keep_alive_refs)
+        batch_result.extra_keep_alive_refs = keep_alive
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -3970,8 +3999,10 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                keep_alive = self._pdmux_keep_alive_if_submitting(batch)
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(batch)
+                self._pdmux_attach_keep_alive(batch_result, keep_alive)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3995,9 +4026,11 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                keep_alive = self._pdmux_keep_alive_if_submitting(batch)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                self._pdmux_attach_keep_alive(batch_result, keep_alive)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
@@ -4378,6 +4411,11 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
+            # A PDMux prefill that is formed or in flight lives outside
+            # running_batch / last_batch until it is merged. flush_cache gates on
+            # this predicate and would reset the tree cache and the request / KV
+            # pools underneath it.
+            and not self.pdmux_inflight_prefill_batches()
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -4769,6 +4807,7 @@ class Scheduler(
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
+        inflight_batches += self.pdmux_inflight_prefill_batches()
         return {
             req for batch in inflight_batches if batch is not None for req in batch.reqs
         }

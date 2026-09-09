@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -74,6 +75,15 @@ class Sampler(nn.Module):
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
+        # Under PDMux the TP group is lane-dependent: get_tp_group() returns the
+        # duplicate prefill communicator while the prefill lane is active. A
+        # group cached here would make the prefill lane's sync share the decode
+        # lane's communicator with a decode collective in flight, so that mode
+        # resolves the group per call instead. DP attention keeps its cached
+        # group: attn_tp_group is not lane-dependent, so it is already correct.
+        self._resolve_tp_sync_group_per_call = (
+            is_pdmux_enabled() and not is_dp_attention_enabled()
+        )
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -505,10 +515,15 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
+            group = (
+                get_tp_group().device_group
+                if self._resolve_tp_sync_group_per_call
+                else self.tp_sync_group
+            )
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
+                group=group,
             )
 
     def compute_logprobs_only(

@@ -27,6 +27,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -334,7 +335,16 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            # One instance owns one symmetric buffer and one signal pad, and
+            # skip_entry_sync assumes a cross-rank sync separates consecutive
+            # calls. Under PDMux the two lanes can gather concurrently from
+            # different streams, which breaks both assumptions; fall back to the
+            # plain all-gather, which resolves its group per call.
+            enabled=(
+                self.do_tensor_parallel_all_gather
+                and not self.use_attn_tp_group
+                and not is_pdmux_enabled()
+            ),
             skip_entry_sync=True,
         )
 
