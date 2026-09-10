@@ -488,6 +488,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if batch_output.logits_output is None:
             return batch_output
+        if batch.forward_mode.is_idle():
+            return self._decode_idle_result(on_publish=None)
         return self._finalize_prefill(batch, batch_output, on_publish=None)
 
     def _finalize_prefill(

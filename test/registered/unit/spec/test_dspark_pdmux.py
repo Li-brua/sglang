@@ -54,6 +54,32 @@ class TestDSparkPDMux(unittest.TestCase):
             batch, final, on_publish=None
         )
 
+    def test_layerwise_prefill_idle_rank_skips_prefill_finalization(self):
+        intermediate = SimpleNamespace(logits_output=None)
+        final = SimpleNamespace(logits_output=object())
+        target_worker = SimpleNamespace(
+            forward_batch_split_prefill=Mock(side_effect=[intermediate, final])
+        )
+        worker = object.__new__(DSparkWorkerV2)
+        worker._target_worker = target_worker
+        worker._verify_planner = SimpleNamespace(note_non_decode_step=Mock())
+        worker._observers = SimpleNamespace(note_prefill_step=Mock())
+        worker._decode_idle_result = Mock(return_value="idle")
+        worker._finalize_prefill = Mock()
+        batch = SimpleNamespace(
+            split_index=0,
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+        )
+
+        first = worker.forward_batch_split_prefill(batch)
+        batch.split_index = 1
+        second = worker.forward_batch_split_prefill(batch)
+
+        self.assertIs(first, intermediate)
+        self.assertEqual(second, "idle")
+        worker._decode_idle_result.assert_called_once_with(on_publish=None)
+        worker._finalize_prefill.assert_not_called()
+
     def test_stream_switch_updates_target_and_draft_runners(self):
         worker = object.__new__(DSparkWorkerV2)
         worker.model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
