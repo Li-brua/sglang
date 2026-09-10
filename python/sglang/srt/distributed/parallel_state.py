@@ -2456,19 +2456,11 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
 
-    # PDMux runs prefill and decode collectives concurrently on two dedicated TP
-    # communicators. Custom all-reduce is selected from the machine topology and
-    # adds a separate IPC/symmetric-memory rendezvous, so two otherwise identical
-    # hosts can take different startup paths. Keep PDMux on its supported dual-
-    # PyNCCL path; preserve the normal custom-AR default outside PDMux.
-    tp_use_custom_allreduce = False if duplicate_tp_group else None
-
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_custom_allreduce=tp_use_custom_allreduce,
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
@@ -2485,7 +2477,6 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_custom_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,

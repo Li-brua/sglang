@@ -89,63 +89,6 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("duplicate_tp_group", "expected_custom_allreduce"),
-    [(False, None), (True, False)],
-)
-def test_pdmux_tp_groups_use_dedicated_pynccl_communicators(
-    duplicate_tp_group, expected_custom_allreduce
-):
-    """PDMux must not route either TP lane through custom all-reduce."""
-    world_size = 8
-    created_groups = {}
-
-    def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
-        group_name = kwargs.get("group_name", "unknown")
-        created_groups[group_name] = kwargs
-        mock_group = Mock()
-        mock_group.device_group = Mock()
-        mock_group.pynccl_comm = Mock()
-        return mock_group
-
-    with (
-        patch.object(parallel_state, "_TP", None),
-        patch.object(parallel_state, "_PDMUX_PREFILL_TP_GROUP", None),
-        patch.object(parallel_state, "_DCP", None),
-        patch.object(parallel_state, "_ATTN_CP", None),
-        patch.object(parallel_state, "_ATTN_TP", None),
-        patch.object(parallel_state, "_MOE_DP", None),
-        patch.object(parallel_state, "_MOE_EP", None),
-        patch.object(parallel_state, "_MOE_TP", None),
-        patch.object(parallel_state, "_PP", None),
-        patch("torch.distributed.is_initialized", return_value=True),
-        patch("torch.distributed.get_world_size", return_value=world_size),
-        patch("torch.distributed.get_rank", return_value=0),
-        patch("torch.distributed.get_backend", return_value="nccl"),
-        patch.object(
-            parallel_state,
-            "init_model_parallel_group",
-            side_effect=mock_init_model_parallel_group,
-        ),
-        patch.object(parallel_state, "get_world_group") as mock_world_group,
-    ):
-        mock_world = Mock()
-        mock_world.device_group = Mock()
-        mock_world.local_rank = 0
-        mock_world_group.return_value = mock_world
-
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=world_size,
-            duplicate_tp_group=duplicate_tp_group,
-        )
-
-    assert created_groups["tp"]["use_custom_allreduce"] is expected_custom_allreduce
-    if duplicate_tp_group:
-        assert (
-            created_groups["pdmux_prefill_tp"]["use_custom_allreduce"] is False
-        )
-
-
 def test_parallel_group_construction_tp8_attn_cp2():
     """
     Test parallel group construction for 8 GPU configuration with:
