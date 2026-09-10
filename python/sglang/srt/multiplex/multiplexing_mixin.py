@@ -213,7 +213,7 @@ class SchedulerMultiplexMixin:
     def update_prefill_batch(
         self: Scheduler, sm_count: int, running_batch: ScheduleBatch
     ) -> tuple[bool, ScheduleBatch]:
-        if self.prefill_batch:
+        if self.prefill_batch is not None:
             return False, running_batch
 
         # No token chunk forward is in flight here, which matches the normal
@@ -225,7 +225,16 @@ class SchedulerMultiplexMixin:
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
-        if batch and not batch.is_empty():
+        # PDMux forms batches outside Scheduler.get_next_batch_to_run(), so it
+        # must perform the same DP/MLP synchronization here. Call it even when
+        # there is no local prefill: peer DP ranks may have work, in which case
+        # the adapter produces an idle batch and keeps the lane's collectives
+        # aligned. Without this, DeepSeek V4 reaches its first DP gather with no
+        # global token-count metadata.
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        # An idle batch has no requests by construction, but still must run so
+        # this DP rank participates in a peer rank's prefill collectives.
+        if batch is not None:
             self.prefill_batch = batch
             return True, running_batch
         return False, running_batch
@@ -468,18 +477,21 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 # process decode batch
-                if running_batch and not running_batch.is_empty():
-                    decode_result = self.run_batch(running_batch)
+                # Mirror the regular scheduler's per-step DP/MLP sync. Passing
+                # None on a locally idle rank is intentional: the adapter may
+                # synthesize an idle batch so it can join peer decode
+                # collectives without replacing this rank's running batch.
+                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    running_batch if not running_batch.is_empty() else None
+                )
+                if decode_batch is not None:
+                    decode_result = self.run_batch(decode_batch)
                     decode_done = True
                 else:
                     decode_done = False
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
-                if (
-                    self.prefill_batch
-                    and not self.prefill_batch.is_empty()
-                    and not wait_prefill_kernel_done
-                ):
+                if self.prefill_batch is not None and not wait_prefill_kernel_done:
                     # ``get_new_batch_prefill`` already applies the configured
                     # token chunk limit. Run that ordinary EXTEND batch through
                     # all model layers in one forward; PDMux only overlaps the
@@ -494,7 +506,7 @@ class SchedulerMultiplexMixin:
                 decode_stream.synchronize()
                 with torch.cuda.stream(decode_stream):
                     set_pdmux_status(False)
-                    self.process_batch_result(running_batch, decode_result)
+                    self.process_batch_result(decode_batch, decode_result)
 
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)

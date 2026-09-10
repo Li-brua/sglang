@@ -24,6 +24,7 @@ SCHEDULER_PATH = (
     Path(__file__).resolve().parents[4] / "python/sglang/srt/managers/scheduler.py"
 )
 TP_WORKER_PATH = SCHEDULER_PATH.parent / "tp_worker.py"
+DP_ATTN_PATH = SCHEDULER_PATH.parent / "scheduler_components" / "dp_attn.py"
 
 
 def _init_call_order(class_name, targets):
@@ -488,6 +489,37 @@ class TestPDMuxScheduler(unittest.TestCase):
         set_pdmux_status(False)
         self.assertFalse(is_pdmux_prefill_enabled())
 
+    def test_dp_attn_adapter_uses_active_pdmux_tp_group(self):
+        tree = ast.parse(DP_ATTN_PATH.read_text(encoding="utf-8"))
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "SchedulerDPAttnAdapter"
+        )
+        method = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "prepare_mlp_sync_batch"
+        )
+        prepare_call = next(
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "prepare_mlp_sync_batch_raw"
+        )
+        tp_group = next(
+            keyword.value
+            for keyword in prepare_call.keywords
+            if keyword.arg == "tp_group"
+        )
+
+        self.assertIsInstance(tp_group, ast.Call)
+        self.assertIsInstance(tp_group.func, ast.Name)
+        self.assertEqual(tp_group.func.id, "get_tp_group")
+
     def test_pdmux_cli_sm_group_num_is_used_without_yaml(self):
         config = load_pdmux_config(None, default_sm_group_num=3)
 
@@ -780,6 +812,9 @@ manual_divisions:
                     batch_to_run=None, running_batch=running_batch
                 )
             ),
+            dp_attn_adapter=SimpleNamespace(
+                maybe_prepare_mlp_sync_batch=Mock(return_value=None)
+            ),
         )
 
         created, returned = SchedulerMultiplexMixin.update_prefill_batch(
@@ -787,8 +822,113 @@ manual_divisions:
         )
 
         scheduler.process_pending_chunked_abort.assert_called_once_with()
+        scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.assert_called_once_with(
+            None
+        )
         self.assertFalse(created)
         self.assertIs(returned, running_batch)
+
+    def test_update_prefill_batch_prepares_dp_attention_metadata(self):
+        """PDMux prefill formation must initialize the DP/MLP sync fields.
+
+        The regular scheduler prepares these fields in
+        ``get_next_batch_to_run``; PDMux stores the batch directly and must do
+        the equivalent work before launching it on the prefill stream.
+        """
+        running_batch = _Batch(empty=True)
+        batch = _Batch(empty=False)
+        prepared_batch = _Batch(empty=False)
+        adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=Mock(return_value=prepared_batch)
+        )
+        scheduler = SimpleNamespace(
+            prefill_batch=None,
+            process_pending_chunked_abort=Mock(),
+            get_new_batch_prefill=Mock(
+                return_value=SimpleNamespace(
+                    batch_to_run=batch, running_batch=running_batch
+                )
+            ),
+            dp_attn_adapter=adapter,
+        )
+
+        created, returned = SchedulerMultiplexMixin.update_prefill_batch(
+            scheduler, 1, running_batch
+        )
+
+        self.assertTrue(created)
+        self.assertIs(returned, running_batch)
+        self.assertIs(scheduler.prefill_batch, prepared_batch)
+        adapter.maybe_prepare_mlp_sync_batch.assert_called_once_with(batch)
+
+    def test_update_prefill_batch_accepts_peer_dp_idle_batch(self):
+        """A rank with no local request must still run a peer's DP prefill step."""
+        running_batch = _Batch(empty=True)
+        idle_batch = _Batch(empty=True)
+        adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=Mock(return_value=idle_batch)
+        )
+        scheduler = SimpleNamespace(
+            prefill_batch=None,
+            process_pending_chunked_abort=Mock(),
+            get_new_batch_prefill=Mock(
+                return_value=SimpleNamespace(
+                    batch_to_run=None, running_batch=running_batch
+                )
+            ),
+            dp_attn_adapter=adapter,
+        )
+
+        created, returned = SchedulerMultiplexMixin.update_prefill_batch(
+            scheduler, 1, running_batch
+        )
+
+        self.assertTrue(created)
+        self.assertIs(returned, running_batch)
+        self.assertIs(scheduler.prefill_batch, idle_batch)
+        adapter.maybe_prepare_mlp_sync_batch.assert_called_once_with(None)
+
+    def test_event_loop_prepares_decode_dp_attention_metadata(self):
+        """PDMux decode bypasses get_next_batch_to_run and needs its own sync."""
+
+        class StopLoop(Exception):
+            pass
+
+        @contextmanager
+        def use_stream(_stream):
+            yield
+
+        running_batch = _Batch(empty=True)
+        prefill_stream = Mock()
+        decode_stream = Mock()
+        adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=Mock(side_effect=StopLoop)
+        )
+        scheduler = SimpleNamespace(
+            running_batch=running_batch,
+            prefill_batch=None,
+            stream_groups=[(prefill_stream, decode_stream)],
+            sm_counts=[(1, 1)],
+            request_receiver=SimpleNamespace(recv_requests=Mock(return_value=[])),
+            process_input_requests=Mock(),
+            update_prefill_batch=Mock(return_value=(False, running_batch)),
+            update_running_batch=Mock(return_value=running_batch),
+            on_idle=Mock(),
+            dp_attn_adapter=adapter,
+        )
+
+        with (
+            self._stubbed_stream_idx(),
+            patch(
+                "sglang.srt.multiplex.multiplexing_mixin.torch.cuda.stream",
+                side_effect=use_stream,
+            ),
+            patch("sglang.srt.multiplex.multiplexing_mixin.torch.cuda.empty_cache"),
+            self.assertRaises(StopLoop),
+        ):
+            SchedulerMultiplexMixin.event_loop_pdmux(scheduler)
+
+        adapter.maybe_prepare_mlp_sync_batch.assert_called_once_with(None)
 
     def test_update_prefill_batch_defers_abort_while_chunk_in_flight(self):
         """Tearing down a chunked request while its token forward is running
