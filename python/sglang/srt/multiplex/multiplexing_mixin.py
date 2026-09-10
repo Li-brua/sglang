@@ -32,9 +32,13 @@ logger = logging.getLogger(__name__)
 
 class SchedulerMultiplexMixin:
     def init_pdmux(self: Scheduler):
-        # The current token-chunk prefill batch. PDMux overlaps this ordinary
-        # EXTEND forward with decode; it does not split the model by layer.
+        # The current token-chunk prefill batch. By default PDMux submits all
+        # model layers together; optional layerwise mode resumes the same token
+        # chunk across several model forwards.
         self.prefill_batch: Optional[ScheduleBatch] = None
+        self.enable_pdmux_layerwise_prefill = getattr(
+            get_disagg(), "enable_pdmux_layerwise_prefill", False
+        )
         # Identity marker for the work item currently being submitted through
         # run_batch (see `_submit_pdmux_prefill`). Set only around that call so a
         # batch that becomes the decode batch is never mistaken for a prefill.
@@ -58,7 +62,11 @@ class SchedulerMultiplexMixin:
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
         logger.info(
-            f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
+            "PD-Multiplexing enabled with %s stream groups, sm_counts "
+            "(prefill_sm, decode_sm): %s, layerwise_prefill=%s",
+            self.real_sm_group_num,
+            self.sm_counts,
+            self.enable_pdmux_layerwise_prefill,
         )
 
     def pdmux_inflight_prefill_batches(self: Scheduler) -> List[ScheduleBatch]:
@@ -126,13 +134,24 @@ class SchedulerMultiplexMixin:
         is ready an iteration early just votes 1 until stragglers catch up -- the
         reduced sum is the only decision input and no rank can finalize on a
         different iteration. A new flag tensor each vote: the previous one may
-        still be owned by the Work waited on above. Returns (running_batch, merged).
+        still be owned by the Work waited on above. Returns whether the current
+        segment completed; final segments also merge the token chunk.
         """
         if self._pdmux_prefill_done_vote is not None:
             # Consume last iteration's vote.
             self._pdmux_prefill_done_vote.wait()
             self._pdmux_prefill_done_vote = None
             if self._pdmux_prefill_done_flags.item() == self.ps.tp_size:
+                if (
+                    getattr(self, "enable_pdmux_layerwise_prefill", False)
+                    and not self.prefill_batch.split_prefill_finished
+                ):
+                    # The layer segment is complete, but this token chunk still
+                    # has layers left. Keep the persistent ForwardBatch and
+                    # discard only the completed segment's result and event.
+                    self._pdmux_prefill_result = None
+                    self._pdmux_prefill_exe_done = None
+                    return running_batch, True
                 running_batch = self._merge_finished_prefill_batch(
                     self._pdmux_prefill_result,
                     prefill_stream,
@@ -235,9 +254,80 @@ class SchedulerMultiplexMixin:
         # An idle batch has no requests by construction, but still must run so
         # this DP rank participates in a peer rank's prefill collectives.
         if batch is not None:
+            if getattr(self, "enable_pdmux_layerwise_prefill", False):
+                batch.split_index = 0
+                batch.split_prefill_finished = False
+                batch.split_forward_count = 1
+                batch.split_forward_batch = None
             self.prefill_batch = batch
             return True, running_batch
         return False, running_batch
+
+    def _get_split_forward_count(
+        self: Scheduler,
+        prefill_sm_count: Optional[int] = None,
+        decode_sm_count: Optional[int] = None,
+        decode_batch: Optional[ScheduleBatch] = None,
+    ) -> int:
+        """Choose how many model layers the next segment should run."""
+        remaining_layers = (
+            self.model_config.num_hidden_layers - self.prefill_batch.split_index
+        )
+
+        prefill_global_tokens = getattr(
+            self.prefill_batch, "global_num_tokens", None
+        )
+        prefill_tokens = (
+            sum(prefill_global_tokens)
+            if prefill_global_tokens is not None
+            else self.prefill_batch.extend_num_tokens
+        )
+        decode_global_tokens = (
+            getattr(decode_batch, "global_num_tokens", None)
+            if decode_batch is not None
+            else None
+        )
+        if decode_global_tokens is not None:
+            decode_tokens = sum(decode_global_tokens)
+        elif self.running_batch is None or self.running_batch.is_empty():
+            decode_tokens = 0
+        else:
+            decode_tokens = self.running_batch.batch_size()
+
+        # Without decode work there is nothing to interleave, so finish the
+        # token chunk in one call and avoid per-segment scheduler overhead.
+        if decode_tokens <= 0:
+            return remaining_layers
+        if prefill_tokens <= 0:
+            return remaining_layers
+
+        forward_count = max(
+            1,
+            self.pdmux_config.split_forward_token_budget // prefill_tokens,
+        )
+
+        # Keep an exclusive prefill partition busy for roughly one concurrent
+        # decode step. Full-device decode intentionally retains the configured
+        # token-layer budget to limit contention.
+        if (
+            prefill_sm_count
+            and decode_sm_count
+            and not self.pdmux_config.overlap_decode_full_sm
+        ):
+            proportional_work = (
+                decode_tokens
+                * self.model_config.num_hidden_layers
+                * prefill_sm_count
+            )
+            proportional_work = (
+                proportional_work + decode_sm_count - 1
+            ) // decode_sm_count
+            proportional_layers = (
+                proportional_work + prefill_tokens - 1
+            ) // prefill_tokens
+            forward_count = max(forward_count, proportional_layers)
+
+        return min(forward_count, remaining_layers)
 
     def init_pdmux_prefill_plan_limit(
         self: Scheduler, attn_backend: AttentionBackend
@@ -324,7 +414,17 @@ class SchedulerMultiplexMixin:
         running_batch: ScheduleBatch,
     ) -> ScheduleBatch:
         batch = self.prefill_batch
+        if getattr(self, "enable_pdmux_layerwise_prefill", False):
+            assert batch.split_prefill_finished
         self.process_batch_result(batch, prefill_result)
+        if getattr(self, "enable_pdmux_layerwise_prefill", False):
+            # The persistent ForwardBatch owns token inputs and intermediate
+            # hidden states across layer segments. Release it before this
+            # ScheduleBatch is merged into decode or parked for another chunk.
+            batch.split_forward_batch = None
+            batch.split_index = 0
+            batch.split_forward_count = 1
+            batch.split_prefill_finished = False
 
         # Mirror get_next_batch_to_run's chunked bookkeeping: a request that
         # only finished a middle chunk must stay out of the decode batch, and
@@ -492,14 +592,27 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 if self.prefill_batch is not None and not wait_prefill_kernel_done:
-                    # ``get_new_batch_prefill`` already applies the configured
-                    # token chunk limit. Run that ordinary EXTEND batch through
-                    # all model layers in one forward; PDMux only overlaps the
-                    # resulting prefill work with decode on separate streams.
+                    if getattr(self, "enable_pdmux_layerwise_prefill", False):
+                        forward_count = self._get_split_forward_count(
+                            prefill_sm_count=self.sm_counts[stream_idx][0],
+                            decode_sm_count=self.sm_counts[stream_idx][1],
+                            decode_batch=decode_batch,
+                        )
+                        next_split_index = min(
+                            self.prefill_batch.split_index + forward_count,
+                            self.model_config.num_hidden_layers,
+                        )
+                        self.prefill_batch.split_forward_count = forward_count
+                        self.prefill_batch.split_prefill_finished = (
+                            next_split_index == self.model_config.num_hidden_layers
+                        )
+
                     wait_prefill_kernel_done = True
                     self._pdmux_prefill_result = self._submit_pdmux_prefill(
                         self.prefill_batch
                     )
+                    if getattr(self, "enable_pdmux_layerwise_prefill", False):
+                        self.prefill_batch.split_index = next_split_index
                     self._pdmux_prefill_exe_done = prefill_stream.record_event()
 
             if decode_done:
@@ -514,11 +627,12 @@ class SchedulerMultiplexMixin:
                     # Runs every iteration a prefill is tracked, including the
                     # submission iteration (issues the first vote). One vote per
                     # iteration, consumed at the top of the next one.
-                    running_batch, merged = self._advance_pdmux_prefill(
+                    running_batch, segment_done = self._advance_pdmux_prefill(
                         running_batch=running_batch,
                         prefill_stream=prefill_stream,
                         decode_stream=decode_stream,
                     )
-                    if merged:
+                    if segment_done:
                         wait_prefill_kernel_done = False
-                        adjust_stream_group = True
+                        if self.prefill_batch is None:
+                            adjust_stream_group = True

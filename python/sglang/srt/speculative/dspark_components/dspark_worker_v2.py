@@ -108,6 +108,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
+        if get_disagg().enable_pdmux_layerwise_prefill and not getattr(
+            self.model_runner.model, "supports_pdmux_layerwise_prefill", False
+        ):
+            raise NotImplementedError(
+                "PDMux layerwise prefill with DSPARK requires a target model "
+                "that preserves DSPARK auxiliary hidden states across segments."
+            )
+
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
@@ -466,6 +474,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
         return self._finalize_prefill(batch, batch_output, on_publish)
+
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Run one target layer segment and finalize DSPARK on the last one."""
+        if batch.split_index == 0:
+            self._verify_planner.note_non_decode_step()
+            self._observers.note_prefill_step()
+
+        batch_output = self.target_worker.forward_batch_split_prefill(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        if batch_output.logits_output is None:
+            return batch_output
+        return self._finalize_prefill(batch, batch_output, on_publish=None)
 
     def _finalize_prefill(
         self,

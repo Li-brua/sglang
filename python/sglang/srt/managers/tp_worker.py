@@ -697,3 +697,49 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+
+    def forward_batch_split_prefill(
+        self,
+        batch: ScheduleBatch,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+    ) -> GenerationBatchResult:
+        """Run one resumable PDMux layerwise-prefill segment."""
+        if not getattr(
+            self.model_runner.model, "supports_pdmux_layerwise_prefill", False
+        ):
+            raise NotImplementedError(
+                "Layerwise PDMux prefill is only implemented by models that "
+                "declare supports_pdmux_layerwise_prefill."
+            )
+
+        # Decode segments reset the active HiCache consumer. Reinstall the
+        # prefill batch's consumer before every layer segment reads KV.
+        self.set_hicache_consumer(batch.hicache_consumer_index)
+
+        if batch.split_index == 0:
+            batch.split_forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+            )
+
+        out = self.model_runner.forward(
+            batch.split_forward_batch,
+            split_forward_count=batch.split_forward_count,
+        )
+        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+        next_token_ids = (
+            self.model_runner.sample(logits_output, batch.split_forward_batch)
+            if logits_output is not None
+            else None
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            can_run_cuda_graph=can_run_cuda_graph,
+            expert_distribution_metrics=out.expert_distribution_metrics,
+            routed_experts_output=out.routed_experts_output,
+            indexer_topk_output=out.indexer_topk_output,
+        )

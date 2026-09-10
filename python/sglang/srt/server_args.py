@@ -3295,6 +3295,16 @@ class ServerArgs:
     enable_pdmux: A[
         bool, "Enable PD-Multiplexing, PD running on greenctx stream.", NS("disagg")
     ] = False
+    enable_pdmux_layerwise_prefill: A[
+        bool,
+        (
+            "Enable layerwise PDMux prefill. Token chunks are still bounded by "
+            "--chunked-prefill-size, while each overlapped prefill segment runs "
+            "a subset of model layers selected by split_forward_token_budget in "
+            "the PDMux YAML config."
+        ),
+        NS("disagg"),
+    ] = False
     pdmux_config_path: A[
         Optional[str], "The path of the PD-Multiplexing config file.", NS("disagg")
     ] = None
@@ -10356,6 +10366,10 @@ class ServerArgs:
             ), "chunked_prefill_size must be divisible by page_size"
 
         # Check pdmux
+        if cfg.enable_pdmux_layerwise_prefill:
+            assert cfg.enable_pdmux, (
+                "--enable-pdmux-layerwise-prefill requires --enable-pdmux."
+            )
         if cfg.enable_pdmux:
             assert (
                 cfg.pp_size == 1

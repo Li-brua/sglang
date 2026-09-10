@@ -93,20 +93,164 @@ class TestPDMuxScheduler(unittest.TestCase):
         self,
         *,
         decode_empty,
+        split_index=0,
         extend_num_tokens=128000,
+        token_budget=65536,
+        overlap_decode_full_sm=False,
     ):
         return SimpleNamespace(
             model_config=SimpleNamespace(num_hidden_layers=61),
             running_batch=_Batch(decode_empty),
-            prefill_batch=SimpleNamespace(extend_num_tokens=extend_num_tokens),
+            pdmux_config=SimpleNamespace(
+                split_forward_token_budget=token_budget,
+                overlap_decode_full_sm=overlap_decode_full_sm,
+            ),
+            prefill_batch=SimpleNamespace(
+                split_index=split_index,
+                extend_num_tokens=extend_num_tokens,
+            ),
         )
 
-    def test_prefill_batch_keeps_the_token_chunk_mode(self):
-        """PDMux must not replace the normal token chunk with layer state."""
+    def test_layerwise_prefill_runs_remaining_layers_without_decode_work(self):
+        scheduler = self._make_scheduler(decode_empty=True, split_index=7)
+
+        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
+
+        self.assertEqual(count, 54)
+
+    def test_layerwise_prefill_uses_token_layer_budget_with_decode_work(self):
         scheduler = self._make_scheduler(decode_empty=False)
 
-        self.assertEqual(scheduler.prefill_batch.extend_num_tokens, 128000)
-        self.assertFalse(hasattr(scheduler.prefill_batch, "split_index"))
+        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
+
+        self.assertEqual(count, 1)
+
+    def test_layerwise_prefill_count_is_clamped_to_remaining_layers(self):
+        scheduler = self._make_scheduler(
+            decode_empty=False,
+            split_index=59,
+            extend_num_tokens=8192,
+        )
+
+        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
+
+        self.assertEqual(count, 2)
+
+    def test_layerwise_prefill_expands_short_exclusive_segment(self):
+        scheduler = self._make_scheduler(
+            decode_empty=False,
+            extend_num_tokens=1024,
+            token_budget=1024,
+        )
+        scheduler.running_batch.batch_size = lambda: 32
+
+        count = SchedulerMultiplexMixin._get_split_forward_count(
+            scheduler,
+            prefill_sm_count=96,
+            decode_sm_count=32,
+        )
+
+        self.assertEqual(count, 6)
+
+    def test_layerwise_prefill_keeps_budget_with_full_sm_decode(self):
+        scheduler = self._make_scheduler(
+            decode_empty=False,
+            extend_num_tokens=1024,
+            token_budget=1024,
+            overlap_decode_full_sm=True,
+        )
+        scheduler.running_batch.batch_size = lambda: 32
+
+        count = SchedulerMultiplexMixin._get_split_forward_count(
+            scheduler,
+            prefill_sm_count=32,
+            decode_sm_count=128,
+        )
+
+        self.assertEqual(count, 1)
+
+    def test_layerwise_prefill_uses_rank_stable_dp_token_counts(self):
+        scheduler = self._make_scheduler(
+            decode_empty=True,
+            extend_num_tokens=1,
+            token_budget=65536,
+        )
+        scheduler.prefill_batch.global_num_tokens = [8192] * 8
+        decode_batch = SimpleNamespace(global_num_tokens=[1] * 8)
+
+        count = SchedulerMultiplexMixin._get_split_forward_count(
+            scheduler,
+            decode_batch=decode_batch,
+        )
+
+        self.assertEqual(count, 1)
+
+    def test_intermediate_layer_segment_does_not_merge_token_chunk(self):
+        running_batch = object()
+        merge_finished = Mock()
+        scheduler = SimpleNamespace(
+            enable_pdmux_layerwise_prefill=True,
+            prefill_batch=SimpleNamespace(split_prefill_finished=False),
+            _pdmux_prefill_done_vote=SimpleNamespace(wait=Mock()),
+            _pdmux_prefill_done_flags=SimpleNamespace(item=lambda: 1),
+            _pdmux_prefill_result=object(),
+            _pdmux_prefill_exe_done=object(),
+            ps=SimpleNamespace(tp_size=1),
+            _merge_finished_prefill_batch=merge_finished,
+        )
+
+        returned, segment_done = SchedulerMultiplexMixin._advance_pdmux_prefill(
+            scheduler,
+            running_batch=running_batch,
+            prefill_stream=object(),
+            decode_stream=object(),
+        )
+
+        self.assertIs(returned, running_batch)
+        self.assertTrue(segment_done)
+        self.assertIsNone(scheduler._pdmux_prefill_result)
+        self.assertIsNone(scheduler._pdmux_prefill_exe_done)
+        merge_finished.assert_not_called()
+
+    def test_finished_layerwise_prefill_releases_persistent_forward_batch(self):
+        split_forward_batch = object()
+        batch = SimpleNamespace(
+            split_prefill_finished=True,
+            split_forward_batch=split_forward_batch,
+            split_index=61,
+            split_forward_count=3,
+            chunked_req=None,
+            batch_size=Mock(side_effect=[1, 1]),
+            filter_batch=Mock(),
+            is_empty=Mock(return_value=True),
+        )
+        merge_event = object()
+        prefill_stream = SimpleNamespace(record_event=Mock(return_value=merge_event))
+        decode_stream = SimpleNamespace(wait_event=Mock())
+        running_batch = SimpleNamespace(batch_is_full=True)
+        scheduler = SimpleNamespace(
+            enable_pdmux_layerwise_prefill=True,
+            prefill_batch=batch,
+            process_batch_result=Mock(),
+            chunked_req=None,
+            running_batch=running_batch,
+        )
+
+        returned = SchedulerMultiplexMixin._merge_finished_prefill_batch(
+            scheduler,
+            prefill_result=object(),
+            prefill_stream=prefill_stream,
+            decode_stream=decode_stream,
+            running_batch=running_batch,
+        )
+
+        self.assertIs(returned, running_batch)
+        self.assertIsNone(batch.split_forward_batch)
+        self.assertEqual(batch.split_index, 0)
+        self.assertEqual(batch.split_forward_count, 1)
+        self.assertFalse(batch.split_prefill_finished)
+        self.assertIsNone(scheduler.prefill_batch)
+        decode_stream.wait_event.assert_called_once_with(merge_event)
 
     def test_dsv4_prefill_admission_uses_planner_hard_limit(self):
         scheduler = SimpleNamespace(
@@ -524,6 +668,18 @@ class TestPDMuxScheduler(unittest.TestCase):
         config = load_pdmux_config(None, default_sm_group_num=3)
 
         self.assertEqual(config.sm_group_num, 3)
+        self.assertEqual(config.split_forward_token_budget, 65536)
+
+    def test_pdmux_rejects_nonpositive_split_forward_token_budget(self):
+        config_text = """\
+sm_group_num: 3
+split_forward_token_budget: 0
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config_file:
+            config_file.write(config_text)
+            config_file.flush()
+            with self.assertRaisesRegex(ValueError, "split_forward_token_budget"):
+                load_pdmux_config(config_file.name)
 
     def test_pdmux_overlap_config_uses_full_device_decode_stream(self):
         config_text = """\

@@ -454,6 +454,9 @@ class Scheduler(
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
         self.enable_pdmux = get_disagg().enable_pdmux
+        self.enable_pdmux_layerwise_prefill = (
+            get_disagg().enable_pdmux_layerwise_prefill
+        )
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -3995,6 +3998,34 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
+            elif (
+                getattr(self, "enable_pdmux_layerwise_prefill", False)
+                and batch is self._pdmux_prefill_batch
+            ):
+                # Resolve token inputs only for the first layer segment. The
+                # persistent ForwardBatch owns them until the final segment.
+                if batch.split_index == 0:
+                    resolve_forward_inputs(batch, self.future_map)
+                keep_alive = self._pdmux_keep_alive_if_submitting(batch)
+                split_worker = getattr(self, "model_worker", None) or self.tp_worker
+                batch_result = split_worker.forward_batch_split_prefill(batch)
+                self._pdmux_attach_keep_alive(batch_result, keep_alive)
+
+                # Intermediate segments produce no logits. Only the final
+                # segment publishes the sampled token or DSPARK draft state.
+                if batch_result.next_draft_input is not None:
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                elif batch_result.has_sampled_token_ids:
+                    self._relay_forward_payload(
+                        batch, batch.req_pool_indices, batch_result
+                    )
+                batch.input_ids = None
+                self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).

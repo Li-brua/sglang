@@ -29,6 +29,31 @@ class TestDSparkPDMux(unittest.TestCase):
             batch, batch_output, on_publish=None
         )
 
+    def test_layerwise_prefill_finalizes_only_after_last_segment(self):
+        intermediate = SimpleNamespace(logits_output=None)
+        final = SimpleNamespace(logits_output=object())
+        target_worker = SimpleNamespace(
+            forward_batch_split_prefill=Mock(side_effect=[intermediate, final])
+        )
+        worker = object.__new__(DSparkWorkerV2)
+        worker._target_worker = target_worker
+        worker._verify_planner = SimpleNamespace(note_non_decode_step=Mock())
+        worker._observers = SimpleNamespace(note_prefill_step=Mock())
+        worker._finalize_prefill = Mock(return_value="finalized")
+        batch = SimpleNamespace(split_index=0)
+
+        first = worker.forward_batch_split_prefill(batch)
+        batch.split_index = 1
+        second = worker.forward_batch_split_prefill(batch)
+
+        self.assertIs(first, intermediate)
+        self.assertEqual(second, "finalized")
+        worker._verify_planner.note_non_decode_step.assert_called_once_with()
+        worker._observers.note_prefill_step.assert_called_once_with()
+        worker._finalize_prefill.assert_called_once_with(
+            batch, final, on_publish=None
+        )
+
     def test_stream_switch_updates_target_and_draft_runners(self):
         worker = object.__new__(DSparkWorkerV2)
         worker.model_runner = SimpleNamespace(update_decode_attn_backend=Mock())

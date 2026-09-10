@@ -25,6 +25,8 @@ class PDMuxConfig:
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
     # ``decode_sm`` is ignored for overlap_decode_full_sm.
     overlap_decode_full_sm: bool = False
+    # Maximum token-layer work submitted in one layerwise prefill segment.
+    split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
 
 
@@ -105,7 +107,10 @@ def load_pdmux_config(
             )
         previous_threshold = threshold
 
+    split_forward_token_budget = raw.get("split_forward_token_budget", 65536)
     decode_bs_divisor = raw.get("decode_bs_divisor", 36)
+    if split_forward_token_budget <= 0:
+        raise ValueError("split_forward_token_budget must be positive")
     if decode_bs_divisor <= 0:
         raise ValueError("decode_bs_divisor must be positive")
 
@@ -113,6 +118,7 @@ def load_pdmux_config(
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
         overlap_decode_full_sm=overlap_decode_full_sm,
+        split_forward_token_budget=split_forward_token_budget,
         decode_bs_divisor=decode_bs_divisor,
     )
 
