@@ -1871,6 +1871,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
+            num_groups=bs,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -2010,6 +2011,7 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=False,
             is_prefill=True,
+            num_groups=batch_size,
         )
         if swa_out_cache_loc is not None:
             # Captures store_cache's cached path instead of a per-layer
