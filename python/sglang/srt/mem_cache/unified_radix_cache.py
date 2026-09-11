@@ -3071,8 +3071,8 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
-    def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
+    def check_hicache_events(self) -> bool:
+        """Poll async HiCache events and report possible device-side work."""
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -3092,10 +3092,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
-            return
+            return False
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+
+        write_back_policy = (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
 
         (
             write_finish_count,
@@ -3129,6 +3134,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+        return (write_back_policy and write_finish_count > 0) or (
+            self.enable_storage and any(storage_queue_sizes)
+        )
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
