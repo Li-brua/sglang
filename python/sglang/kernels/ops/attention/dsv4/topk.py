@@ -227,8 +227,12 @@ def topk_transform_paged_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    enable_cluster: bool = True,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
+
+    ``enable_cluster=False`` uses the streaming kernel for Green Context streams
+    whose SM partition cannot satisfy a fixed cluster launch.
 
     Output mode is chosen from ``page_tables`` and ``out_raw_indices`` and
     resolved to a device-side template parameter, so an unused page-table gather
@@ -278,6 +282,7 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
+        enable_cluster,
     )
 
 

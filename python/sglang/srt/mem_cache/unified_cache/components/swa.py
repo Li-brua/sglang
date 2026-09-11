@@ -452,6 +452,11 @@ class SWAComponent(TreeComponent):
     ) -> int:
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
+        if not self._independent and params.prev_prefix_len > total_prefix_len:
+            # A partially protected prefix aliases this node's FULL pages.
+            # Recovering a dependent SWA tombstone would adopt and free the
+            # same pages; keep it tombstoned until a fresh span can recover it.
+            return prefix_len
 
         window_start = params.get_evicted_seqlen(self.component_type)
         if self._independent:
