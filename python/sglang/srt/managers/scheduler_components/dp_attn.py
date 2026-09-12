@@ -540,7 +540,10 @@ class SchedulerDPAttnAdapter:
             dp_size=get_parallel().dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
-            tp_group=self.tp_group,
+            # PDMux switches to its duplicate TP communicator while forming
+            # the prefill batch. Resolve the group at call time so metadata
+            # collectives follow the same lane as the model collectives.
+            tp_group=get_tp_group(),
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(),

@@ -145,6 +145,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
+        disagg = get_disagg()
+        if (
+            getattr(disagg, "enable_pdmux", False)
+            and getattr(disagg, "pdmux_prefill_mode", "layer_split")
+            == "layer_split"
+            and not getattr(
+                self.model_runner.model, "supports_pdmux_dspark_prefill", False
+            )
+        ):
+            raise NotImplementedError(
+                "PDMux layer-split + DSPARK requires a target model that "
+                "preserves DSPARK auxiliary hidden states across split prefill. "
+                "DeepSeek-V4 is currently supported."
+            )
+
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
@@ -491,6 +506,11 @@ class DSparkWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         pass
 
+    def update_pdmux_decode_attn_backend(self, stream_idx: int) -> None:
+        """Switch target and draft runners to the active PDMux stream group."""
+        self.model_runner.update_decode_attn_backend(stream_idx)
+        self.draft_model_runner.update_decode_attn_backend(stream_idx)
+
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
@@ -533,6 +553,32 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
+        return self._finalize_prefill(batch, batch_output, on_publish)
+
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Run one target split and inject DSpark state after the final split."""
+        if batch.split_index == 0:
+            self._verify_planner.note_non_decode_step()
+            self._observers.note_prefill_step()
+
+        batch_output = self.target_worker.forward_batch_split_prefill(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
+        if batch_output.logits_output is None:
+            return batch_output
+        if batch.forward_mode.is_idle():
+            return self._decode_idle_result(on_publish=None)
+        return self._finalize_prefill(batch, batch_output, on_publish=None)
+
+    def _finalize_prefill(
+        self,
+        batch: ScheduleBatch,
+        batch_output: GenerationBatchResult,
+        on_publish,
+    ) -> GenerationBatchResult:
+        """Inject captured target hidden states into the DSpark draft KV."""
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
             self._target_hidden_projection_enabled
@@ -552,7 +598,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
-                "Make sure the target model has DFlash layers-to-capture configured."
+                "Make sure the target model has DSpark layers-to-capture configured."
             )
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
