@@ -617,7 +617,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     )
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
+            return self._forward_prefill(
+                batch, on_publish, pp_proxy_tensors=pp_proxy_tensors
+            )
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
@@ -654,7 +656,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             if get_parallel().attn_dp_enabled:
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
