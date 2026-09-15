@@ -33,6 +33,10 @@ class PDMuxConfig:
     # CUDA may round a symmetric floor upward; the actual layout is logged.
     overlap_prefill_reserved_sm: int = 0
     overlap_decode_reserved_sm: Optional[int] = None
+    # Layer-prefill only: after a request finishes one incomplete token chunk,
+    # stash it and put it at the tail of the prefill queue. This turns the
+    # privileged chunk continuation into a one-chunk round-robin quantum.
+    layer_prefill_chunk_round_robin: bool = False
 
 
 def is_pdmux_standard_prefill() -> bool:
@@ -118,6 +122,11 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         raise ValueError(
             "overlap_decode_reserved_sm requires a positive overlap_prefill_reserved_sm"
         )
+    layer_prefill_chunk_round_robin = raw.get(
+        "layer_prefill_chunk_round_robin", False
+    )
+    if not isinstance(layer_prefill_chunk_round_robin, bool):
+        raise ValueError("layer_prefill_chunk_round_robin must be a boolean")
 
     return PDMuxConfig(
         sm_group_num=raw["sm_group_num"],
@@ -127,6 +136,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         overlap_decode_full_sm=overlap_decode_full_sm,
         overlap_prefill_reserved_sm=overlap_prefill_reserved_sm,
         overlap_decode_reserved_sm=overlap_decode_reserved_sm,
+        layer_prefill_chunk_round_robin=layer_prefill_chunk_round_robin,
     )
 
 

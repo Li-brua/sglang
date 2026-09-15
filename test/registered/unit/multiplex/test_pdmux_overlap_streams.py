@@ -324,6 +324,26 @@ class PDMuxOverlapStreamTest(unittest.TestCase):
             self.pdmux.load_pdmux_config(path).overlap_prefill_reserved_sm, 0
         )
         self.assertIsNone(self.pdmux.load_pdmux_config(path).overlap_decode_reserved_sm)
+        self.assertFalse(
+            self.pdmux.load_pdmux_config(path).layer_prefill_chunk_round_robin
+        )
+
+    def test_layer_prefill_chunk_round_robin_loads(self):
+        path = self._write_config(
+            "sm_group_num: 3\nmanual_divisions: [[104, 0, 1]]\n"
+            "layer_prefill_chunk_round_robin: true\n"
+        )
+        self.assertTrue(
+            self.pdmux.load_pdmux_config(path).layer_prefill_chunk_round_robin
+        )
+
+    def test_layer_prefill_chunk_round_robin_rejects_non_boolean(self):
+        path = self._write_config(
+            "sm_group_num: 3\nmanual_divisions: [[104, 0, 1]]\n"
+            "layer_prefill_chunk_round_robin: 1\n"
+        )
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            self.pdmux.load_pdmux_config(path)
 
     def test_protected_overlap_requires_overlay(self):
         path = self._write_config(

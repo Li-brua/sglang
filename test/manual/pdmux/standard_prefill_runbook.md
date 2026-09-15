@@ -174,6 +174,25 @@ manual_divisions:
   - [0, 0, 1]
 ```
 
+Layer-prefill mode can rotate long requests after each complete token chunk.
+The chunk is first run through every model layer and stashed in the prefix
+cache; its request is then appended to the waiting-queue tail, so another
+request gets the next chunk quantum. With no other waiter, the same request
+continues immediately. The switch is off by default and does not apply to the
+standard-prefill lane:
+
+```yaml
+layer_prefill_chunk_round_robin: true
+```
+
+The round-robin queue uses FIFO admission order after cache matching has been
+refreshed. This intentionally takes precedence over cache-aware queue sorting
+while the switch is enabled. At each yield, the completed chunk remains in the
+prefix cache, while its request slot and tree/SWA lock are released before the
+request enters the waiting queue. The next turn rematches that prefix and takes
+a fresh lock. Prefix-cache insertion is therefore required; requests that
+cannot insert into the prefix cache keep the sequential continuation behavior.
+
 On Hopper, asymmetric reservations must be expressible using the device's
 8-SM partition alignment. The decode stream has priority `-1` and the prefill
 stream priority `0`, so decode is preferred when both have runnable kernels on
