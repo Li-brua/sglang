@@ -15,6 +15,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PDMUX_CONTEXT_PATH = REPO_ROOT / "python/sglang/srt/multiplex/pdmux_context.py"
@@ -50,13 +51,48 @@ class _FakeSpatial:
 
     def __init__(self):
         self.calls = []
+        self.overlap_calls = []
+        self.asymmetric_overlap_calls = []
+        self.total_sm = TOTAL_SM
 
     def create_greenctx_stream_by_value(self, sm_a, sm_b, device_id):
         self.calls.append((sm_a, sm_b, device_id))
         return (f"greenctx(A={sm_a})", f"greenctx(B={sm_b})")
 
     def get_sm_available(self, device_id):
-        return TOTAL_SM
+        return self.total_sm
+
+    def create_overlapped_greenctx_stream_by_value(self, reserved_sm, device_id):
+        self.overlap_calls.append((reserved_sm, device_id))
+        # Simulate Hopper rounding the requested 28-SM floor up to 32.
+        return (
+            "greenctx(prefill=exclusive+shared)",
+            "greenctx(decode=exclusive+shared,priority=-1)",
+            (100, 100, 32, 32, 68),
+        )
+
+    def create_asymmetric_overlapped_greenctx_stream_by_value(
+        self, prefill_reserved_sm, decode_reserved_sm, device_id
+    ):
+        self.asymmetric_overlap_calls.append(
+            (prefill_reserved_sm, decode_reserved_sm, device_id)
+        )
+        if (prefill_reserved_sm, decode_reserved_sm) == (8, 24):
+            shared = self.total_sm - prefill_reserved_sm - decode_reserved_sm
+            actual = (
+                prefill_reserved_sm + shared,
+                decode_reserved_sm + shared,
+                prefill_reserved_sm,
+                decode_reserved_sm,
+                shared,
+            )
+        else:
+            actual = (100, 100, 32, 32, 68)
+        return (
+            "greenctx(prefill=exclusive+shared)",
+            "greenctx(decode=exclusive+shared,priority=-1)",
+            actual,
+        )
 
 
 def _install_stubs():
@@ -66,6 +102,12 @@ def _install_stubs():
         spatial.create_greenctx_stream_by_value
     )
     spatial_module.get_sm_available = spatial.get_sm_available
+    spatial_module.create_overlapped_greenctx_stream_by_value = (
+        spatial.create_overlapped_greenctx_stream_by_value
+    )
+    spatial_module.create_asymmetric_overlapped_greenctx_stream_by_value = (
+        spatial.create_asymmetric_overlapped_greenctx_stream_by_value
+    )
     sgl_kernel = types.ModuleType("sgl_kernel")
     sgl_kernel.spatial = spatial_module
     sys.modules["sgl_kernel"] = sgl_kernel
@@ -77,17 +119,21 @@ class PDMuxOverlapStreamTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.spatial = _install_stubs()
-        cls.pdmux = _load_module("_pdmux_context_overlap_test", PDMUX_CONTEXT_PATH)
         fake_torch = types.ModuleType("torch")
         fake_torch.cuda = types.SimpleNamespace(
             Stream=_FakeStream,
             current_device=lambda: 0,
             get_device_capability=lambda device: (9, 0),
         )
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            cls.pdmux = _load_module("_pdmux_context_overlap_test", PDMUX_CONTEXT_PATH)
         cls.pdmux.torch = fake_torch
 
     def setUp(self):
         self.spatial.calls.clear()
+        self.spatial.overlap_calls.clear()
+        self.spatial.asymmetric_overlap_calls.clear()
+        self.spatial.total_sm = TOTAL_SM
 
     def _write_config(self, body: str) -> str:
         path = Path(tempfile.mkdtemp()) / "pdmux.yaml"
@@ -124,6 +170,123 @@ class PDMuxOverlapStreamTest(unittest.TestCase):
             [(TOTAL_SM, 0), (PREFILL_CAP, TOTAL_SM), (0, TOTAL_SM)],
         )
 
+    def test_protected_overlap_keeps_shared_sms_and_reports_actual_counts(self):
+        config = self._overlap_config()
+        config.overlap_prefill_reserved_sm = 28
+        self.pdmux.initialize_stream_groups(0, config)
+
+        self.assertEqual(self.spatial.overlap_calls, [(28, 0)])
+        self.assertEqual(self.spatial.calls, [])
+        self.assertEqual(
+            self.pdmux.get_stream_groups()[1],
+            (
+                "greenctx(prefill=exclusive+shared)",
+                "greenctx(decode=exclusive+shared,priority=-1)",
+            ),
+        )
+        self.assertEqual(
+            self.pdmux.get_sm_counts(),
+            [(TOTAL_SM, 0), (100, 100), (0, TOTAL_SM)],
+        )
+
+    def test_asymmetric_protected_overlap_uses_independent_floors(self):
+        config = self._overlap_config()
+        config.manual_divisions = [[108, 0, 1]]
+        config.overlap_prefill_reserved_sm = 8
+        config.overlap_decode_reserved_sm = 24
+        self.pdmux.initialize_stream_groups(0, config)
+
+        self.assertEqual(self.spatial.overlap_calls, [])
+        self.assertEqual(self.spatial.asymmetric_overlap_calls, [(8, 24, 0)])
+        self.assertEqual(
+            self.pdmux.get_sm_counts(),
+            [(TOTAL_SM, 0), (108, 124), (0, TOTAL_SM)],
+        )
+
+    def test_protected_config_is_portable_to_a_148_sm_device(self):
+        self.spatial.total_sm = 148
+        config = self._overlap_config()
+        config.manual_divisions = [[108, 0, 1]]
+        config.overlap_prefill_reserved_sm = 8
+        config.overlap_decode_reserved_sm = 24
+        self.pdmux.initialize_stream_groups(0, config)
+
+        self.assertEqual(
+            self.pdmux.get_sm_counts(),
+            [(148, 0), (124, 140), (0, 148)],
+        )
+
+    def test_asymmetric_protected_overlap_uses_jit_with_stale_kernel(self):
+        config = self._overlap_config()
+        config.manual_divisions = [[108, 0, 1]]
+        config.overlap_prefill_reserved_sm = 8
+        config.overlap_decode_reserved_sm = 24
+        jit_module = types.ModuleType("sglang.srt.multiplex.pdmux_spatial")
+        jit_module.create_overlapped_greenctx_stream_by_value = (
+            self.spatial.create_asymmetric_overlapped_greenctx_stream_by_value
+        )
+        delattr(
+            sys.modules["sgl_kernel.spatial"],
+            "create_asymmetric_overlapped_greenctx_stream_by_value",
+        )
+        try:
+            with patch.dict(
+                sys.modules, {"sglang.srt.multiplex.pdmux_spatial": jit_module}
+            ):
+                self.pdmux.initialize_stream_groups(0, config)
+        finally:
+            sys.modules[
+                "sgl_kernel.spatial"
+            ].create_asymmetric_overlapped_greenctx_stream_by_value = (
+                self.spatial.create_asymmetric_overlapped_greenctx_stream_by_value
+            )
+
+        self.assertEqual(self.spatial.asymmetric_overlap_calls, [(8, 24, 0)])
+        self.assertEqual(
+            self.pdmux.get_sm_counts(),
+            [(TOTAL_SM, 0), (108, 124), (0, TOTAL_SM)],
+        )
+
+    def test_protected_overlap_ignores_manual_sm_columns(self):
+        config = self._overlap_config()
+        config.manual_divisions = [[1, 999, 1]]
+        config.overlap_prefill_reserved_sm = 32
+        self.pdmux.initialize_stream_groups(0, config)
+
+        self.assertEqual(self.spatial.overlap_calls, [(32, 0)])
+        self.assertEqual(
+            self.pdmux.get_sm_counts(),
+            [(TOTAL_SM, 0), (100, 100), (0, TOTAL_SM)],
+        )
+
+    def test_protected_overlap_falls_back_when_kernel_install_is_stale(self):
+        config = self._overlap_config()
+        config.overlap_prefill_reserved_sm = 28
+        jit_module = types.ModuleType("sglang.srt.multiplex.pdmux_spatial")
+        jit_module.create_overlapped_greenctx_stream_by_value = (
+            self.spatial.create_asymmetric_overlapped_greenctx_stream_by_value
+        )
+        delattr(
+            sys.modules["sgl_kernel.spatial"],
+            "create_overlapped_greenctx_stream_by_value",
+        )
+        try:
+            with patch.dict(
+                sys.modules, {"sglang.srt.multiplex.pdmux_spatial": jit_module}
+            ):
+                self.pdmux.initialize_stream_groups(0, config)
+        finally:
+            sys.modules[
+                "sgl_kernel.spatial"
+            ].create_overlapped_greenctx_stream_by_value = (
+                self.spatial.create_overlapped_greenctx_stream_by_value
+            )
+        self.assertEqual(self.spatial.asymmetric_overlap_calls, [(28, 28, 0)])
+        self.assertEqual(
+            self.pdmux.get_sm_counts(),
+            [(TOTAL_SM, 0), (100, 100), (0, TOTAL_SM)],
+        )
+
     def test_mutually_exclusive_mode_is_unchanged(self):
         config = self.pdmux.PDMuxConfig(sm_group_num=3, manual_divisions=[[112, 20, 0]])
         self.pdmux.initialize_stream_groups(0, config)
@@ -157,6 +320,53 @@ class PDMuxOverlapStreamTest(unittest.TestCase):
     def test_overlap_flag_defaults_off(self):
         path = self._write_config("sm_group_num: 3\nmanual_divisions: [[112, 20, 0]]\n")
         self.assertFalse(self.pdmux.load_pdmux_config(path).overlap_decode_full_sm)
+        self.assertEqual(
+            self.pdmux.load_pdmux_config(path).overlap_prefill_reserved_sm, 0
+        )
+        self.assertIsNone(self.pdmux.load_pdmux_config(path).overlap_decode_reserved_sm)
+
+    def test_protected_overlap_requires_overlay(self):
+        path = self._write_config(
+            "sm_group_num: 3\nmanual_divisions: [[104, 28, 0]]\n"
+            "overlap_prefill_reserved_sm: 28\n"
+        )
+        with self.assertRaisesRegex(ValueError, "requires overlap_decode_full_sm"):
+            self.pdmux.load_pdmux_config(path)
+
+    def test_protected_overlap_loads_requested_floor(self):
+        path = self._write_config(
+            "sm_group_num: 3\nmanual_divisions: [[104, 0, 1]]\n"
+            "overlap_decode_full_sm: true\noverlap_prefill_reserved_sm: 28\n"
+        )
+        self.assertEqual(
+            self.pdmux.load_pdmux_config(path).overlap_prefill_reserved_sm, 28
+        )
+
+    def test_decode_floor_requires_prefill_floor(self):
+        path = self._write_config(
+            "sm_group_num: 3\nmanual_divisions: [[108, 0, 1]]\n"
+            "overlap_decode_full_sm: true\noverlap_decode_reserved_sm: 24\n"
+        )
+        with self.assertRaisesRegex(ValueError, "requires a positive"):
+            self.pdmux.load_pdmux_config(path)
+
+    def test_protected_floors_must_leave_shared_sms(self):
+        config = self._overlap_config()
+        config.manual_divisions = [[32, 0, 1]]
+        config.overlap_prefill_reserved_sm = 32
+        config.overlap_decode_reserved_sm = 100
+        with self.assertRaisesRegex(ValueError, "leave at least one shared SM"):
+            self.pdmux.initialize_stream_groups(0, config)
+
+    def test_asymmetric_protected_overlap_loads_both_floors(self):
+        path = self._write_config(
+            "sm_group_num: 3\nmanual_divisions: [[108, 0, 1]]\n"
+            "overlap_decode_full_sm: true\noverlap_prefill_reserved_sm: 8\n"
+            "overlap_decode_reserved_sm: 24\n"
+        )
+        config = self.pdmux.load_pdmux_config(path)
+        self.assertEqual(config.overlap_prefill_reserved_sm, 8)
+        self.assertEqual(config.overlap_decode_reserved_sm, 24)
 
 
 if __name__ == "__main__":
