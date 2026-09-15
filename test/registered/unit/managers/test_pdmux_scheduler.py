@@ -75,6 +75,11 @@ class _ChunkedReq:
     def __init__(self, *, extend_end, prefix_len):
         self.extend_range = SimpleNamespace(end=extend_end)
         self.prefix_indices = [0] * prefix_len
+        self.rid = f"chunk-{extend_end}-{prefix_len}"
+        self.reset_for_chunked_requeue = Mock()
+
+    def finished(self):
+        return False
 
 
 def _make_chunked_req(*, extend_end, prefix_len):
@@ -626,6 +631,147 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
         self.assertIs(merged_batch, running_batch)
         self.assertIsNone(scheduler.split_prefill_batch)
+
+    def test_merge_rotates_stashed_chunk_behind_waiting_requests(self):
+        operations = []
+        chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
+        chunked_req.reset_for_chunked_requeue.side_effect = lambda: operations.append(
+            "reset"
+        )
+        waiting_req = object()
+        split_batch = Mock()
+        split_batch.chunked_req = chunked_req
+        split_batch.split_prefill_finished = True
+        split_batch.batch_size.side_effect = [1, 0]
+        split_batch.is_empty.return_value = True
+        running_batch = Mock()
+        scheduler = SimpleNamespace(
+            pdmux_standard=False,
+            pdmux_config=SimpleNamespace(
+                layer_prefill_chunk_round_robin=True
+            ),
+            waiting_queue=[waiting_req],
+            tree_cache=object(),
+            running_batch=running_batch,
+            split_prefill_batch=split_batch,
+            chunked_req=chunked_req,
+            process_batch_result=Mock(),
+            stash_chunked_request=Mock(
+                side_effect=lambda req: operations.append("stash")
+            ),
+        )
+
+        prefill_stream, decode_stream, _ = self._make_merge_streams([])
+        with patch(
+            "sglang.srt.multiplex.multiplexing_mixin.release_kv_cache",
+            side_effect=lambda *args, **kwargs: operations.append("release"),
+        ) as release:
+            SchedulerMultiplexMixin._merge_finished_prefill_batch(
+                scheduler,
+                prefill_result=object(),
+                prefill_stream=prefill_stream,
+                decode_stream=decode_stream,
+                running_batch=running_batch,
+            )
+
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertEqual(scheduler.waiting_queue, [waiting_req, chunked_req])
+        self.assertEqual(operations, ["stash", "release", "reset"])
+        scheduler.stash_chunked_request.assert_called_once_with(chunked_req)
+        release.assert_called_once_with(
+            chunked_req, scheduler.tree_cache, is_insert=False
+        )
+        chunked_req.reset_for_chunked_requeue.assert_called_once_with()
+
+    def test_merge_keeps_continuation_when_round_robin_is_disabled(self):
+        chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
+        scheduler = SimpleNamespace(
+            pdmux_standard=False,
+            pdmux_config=SimpleNamespace(
+                layer_prefill_chunk_round_robin=False
+            ),
+            waiting_queue=[object()],
+            chunked_req=chunked_req,
+        )
+
+        rotated = SchedulerMultiplexMixin._pdmux_maybe_rotate_chunked_request(
+            scheduler, chunked_req, chunk_stashed=True
+        )
+
+        self.assertFalse(rotated)
+        self.assertIs(scheduler.chunked_req, chunked_req)
+
+    def test_round_robin_keeps_continuation_when_no_request_is_waiting(self):
+        chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
+        scheduler = SimpleNamespace(
+            pdmux_standard=False,
+            pdmux_config=SimpleNamespace(
+                layer_prefill_chunk_round_robin=True
+            ),
+            waiting_queue=[],
+            chunked_req=chunked_req,
+        )
+
+        rotated = SchedulerMultiplexMixin._pdmux_maybe_rotate_chunked_request(
+            scheduler, chunked_req, chunk_stashed=True
+        )
+
+        self.assertFalse(rotated)
+        self.assertIs(scheduler.chunked_req, chunked_req)
+
+    def test_round_robin_requires_an_insertable_prefix_cache(self):
+        chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
+        scheduler = SimpleNamespace(
+            pdmux_standard=False,
+            pdmux_config=SimpleNamespace(
+                layer_prefill_chunk_round_robin=True
+            ),
+            waiting_queue=[object()],
+            tree_cache=SimpleNamespace(disable=True),
+            chunked_req=chunked_req,
+        )
+
+        with patch(
+            "sglang.srt.multiplex.multiplexing_mixin.release_kv_cache"
+        ) as release:
+            rotated = SchedulerMultiplexMixin._pdmux_maybe_rotate_chunked_request(
+                scheduler, chunked_req, chunk_stashed=True
+            )
+
+        self.assertFalse(rotated)
+        self.assertIs(scheduler.chunked_req, chunked_req)
+        release.assert_not_called()
+        chunked_req.reset_for_chunked_requeue.assert_not_called()
+
+    def test_round_robin_is_scoped_to_layer_prefill(self):
+        chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
+        scheduler = SimpleNamespace(
+            pdmux_standard=True,
+            pdmux_config=SimpleNamespace(
+                layer_prefill_chunk_round_robin=True
+            ),
+            waiting_queue=[object()],
+            chunked_req=chunked_req,
+        )
+
+        rotated = SchedulerMultiplexMixin._pdmux_maybe_rotate_chunked_request(
+            scheduler, chunked_req, chunk_stashed=True
+        )
+
+        self.assertFalse(rotated)
+        self.assertIs(scheduler.chunked_req, chunked_req)
+
+    def test_chunk_round_robin_restores_fifo_after_policy_sort(self):
+        first, second, continuation = object(), object(), object()
+        scheduler = SimpleNamespace(
+            waiting_queue=[continuation, second, first]
+        )
+
+        SchedulerMultiplexMixin._pdmux_restore_chunk_round_robin_order(
+            scheduler, [first, second, continuation]
+        )
+
+        self.assertEqual(scheduler.waiting_queue, [first, second, continuation])
 
     def test_merge_of_pure_middle_chunk_keeps_decode_batch(self):
         """A batch holding only a middle chunk merges nothing into decode, but

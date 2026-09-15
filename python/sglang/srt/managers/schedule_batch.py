@@ -1820,11 +1820,8 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
-    def reset_for_retract(self):
-        # Increment retraction count before resetting other state. We should not reset this
-        # since we are tracking the total number of retractions for each request.
-        self.retraction_count += 1
-
+    def _reset_released_kv_state(self):
+        """Clear request fields that point at an already released KV owner."""
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
         self.indexer_topk = None
@@ -1839,11 +1836,6 @@ class Req(ReqDllmMixin):
         self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
-        self.input_token_logprobs = None
-        self.temp_input_top_logprobs_val = None
-        self.temp_input_top_logprobs_idx = None
-        self.temp_input_token_ids_logprobs_val = None
-        self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
@@ -1853,11 +1845,33 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
-        self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+
+    def reset_for_chunked_requeue(self):
+        """Make a released middle-chunk request safe for normal queue admission.
+
+        Unlike decode retraction, chunk rotation must retain accumulated prompt
+        logprobs and prefill accounting. The next admission rematches the chunk
+        that was just inserted into the prefix cache and acquires a fresh
+        request slot and tree lock.
+        """
+        self._reset_released_kv_state()
+
+    def reset_for_retract(self):
+        # Increment retraction count before resetting other state. We should not reset this
+        # since we are tracking the total number of retractions for each request.
+        self.retraction_count += 1
+
+        self._reset_released_kv_state()
+        self.input_token_logprobs = None
+        self.temp_input_top_logprobs_val = None
+        self.temp_input_top_logprobs_idx = None
+        self.temp_input_token_ids_logprobs_val = None
+        self.temp_input_token_ids_logprobs_idx = None
+        self.already_computed = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.

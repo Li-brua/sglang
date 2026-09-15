@@ -15,6 +15,7 @@ from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import set_pdmux_status
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
     get_sm_counts,
@@ -60,6 +61,17 @@ class SchedulerMultiplexMixin:
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(get_disagg().pdmux_config_path)
+        if self.pdmux_config.layer_prefill_chunk_round_robin:
+            if self.pdmux_standard:
+                logger.warning(
+                    "layer_prefill_chunk_round_robin is ignored in "
+                    "standard-prefill mode"
+                )
+            else:
+                logger.info(
+                    "Layer-prefill token-chunk round-robin enabled: each "
+                    "incomplete request yields after one chunk"
+                )
         initialize_stream_groups(self.ps.gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
@@ -85,6 +97,68 @@ class SchedulerMultiplexMixin:
         if self._pdmux_prefill_inflight is not None:
             batches.append(self._pdmux_prefill_inflight.batch)
         return batches
+
+    def _pdmux_layer_chunk_round_robin_enabled(self: Scheduler) -> bool:
+        return bool(
+            not getattr(self, "pdmux_standard", False)
+            and getattr(
+                getattr(self, "pdmux_config", None),
+                "layer_prefill_chunk_round_robin",
+                False,
+            )
+        )
+
+    def _pdmux_restore_chunk_round_robin_order(
+        self: Scheduler, original_order: List[Any]
+    ) -> None:
+        """Restore FIFO order after the policy refreshed prefix-cache matches.
+
+        Chunk round-robin uses the waiting queue itself as the run queue: a
+        completed continuation is appended at its tail. Cache-aware policies
+        still need to run so request prefix metadata stays current, but their
+        sorting must not move that continuation back to the front immediately.
+        """
+        positions = {id(req): index for index, req in enumerate(original_order)}
+        self.waiting_queue.sort(key=lambda req: positions[id(req)])
+
+    def _pdmux_maybe_rotate_chunked_request(
+        self: Scheduler, req: Any, *, chunk_stashed: bool
+    ) -> bool:
+        """Yield an incomplete token-chunk request at a safe chunk boundary."""
+        if (
+            not chunk_stashed
+            or not SchedulerMultiplexMixin._pdmux_layer_chunk_round_robin_enabled(
+                self
+            )
+            or not getattr(self, "waiting_queue", None)
+            or getattr(req, "finished", lambda: False)()
+        ):
+            return False
+
+        if getattr(self.tree_cache, "disable", False) or getattr(
+            req, "skip_radix_cache_insert", False
+        ):
+            if not getattr(self, "_pdmux_chunk_round_robin_cache_warning", False):
+                logger.warning(
+                    "layer_prefill_chunk_round_robin requires prefix-cache "
+                    "insertion; keeping chunk continuations sequential"
+                )
+                self._pdmux_chunk_round_robin_cache_warning = True
+            return False
+
+        # process_batch_result has drained this chunk and stash_chunked_request
+        # has published its KV into the prefix cache. A normal waiting request
+        # must not retain a req slot or a tree/SWA lock: those resources would
+        # have no active-batch owner and can deadlock admission under pressure.
+        # Release only the request ownership (the cached prefix remains), then
+        # re-admit it from the tail with a fresh match and lock.
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        req.reset_for_chunked_requeue()
+        if req not in self.waiting_queue:
+            self.waiting_queue.append(req)
+        self.chunked_req = None
+        logger.debug("Rotated chunked prefill request %s to queue tail", req.rid)
+        return True
 
     def _update_decode_attn_backends(self: Scheduler, stream_idx: int) -> None:
         """Point the decode-side attention backends at this stream group.
@@ -347,17 +421,24 @@ class SchedulerMultiplexMixin:
         # prefix instead of recomputing it.
         chunked_req_to_exclude = set()
         if self.chunked_req is not None:
-            chunked_req_to_exclude.add(self.chunked_req)
+            chunked_req = self.chunked_req
+            chunked_req_to_exclude.add(chunked_req)
             # Stash only when this chunk produced new KV beyond what is
             # already cached. A parked chunk (add_chunked_req hybrid-SWA
             # early-return) has nothing new to cache.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+            chunk_stashed = chunked_req.extend_range.end > len(
+                chunked_req.prefix_indices
+            )
+            if chunk_stashed:
                 # The stash rewrites the request's req_to_token row, which the
                 # sparse-prefill scaffolding cache snapshots at segment 0, so
                 # it is only legal once every split segment has run. A standard
                 # prefill has no segments -- its single forward has already
                 # completed by the time this runs.
-                self.stash_chunked_request(self.chunked_req)
+                self.stash_chunked_request(chunked_req)
+            SchedulerMultiplexMixin._pdmux_maybe_rotate_chunked_request(
+                self, chunked_req, chunk_stashed=chunk_stashed
+            )
         if batch.chunked_req is not None:
             chunked_req_to_exclude.add(batch.chunked_req)
 
