@@ -3875,12 +3875,24 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
-        # Get priority queue
+        # Get priority queue. Layer-prefill chunk round-robin uses physical
+        # queue order as its fairness order, but policy calculation still runs
+        # to refresh prefix/cache metadata used by admission.
+        pdmux_chunk_round_robin_order = (
+            list(self.waiting_queue)
+            if self.enable_pdmux
+            and self._pdmux_layer_chunk_round_robin_enabled()
+            else None
+        )
         self.policy.calc_priority(
             self.waiting_queue,
             running_batch,
             processed_tokens=self.processed_tokens_counter,
         )
+        if pdmux_chunk_round_robin_order is not None:
+            self._pdmux_restore_chunk_round_robin_order(
+                pdmux_chunk_round_robin_order
+            )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
