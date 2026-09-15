@@ -214,6 +214,18 @@ else:
 
         return _impl(*args, **kwargs)
 
+    def create_overlapped_greenctx_stream_by_value(*args, **kwargs):
+        from sgl_kernel.spatial import create_overlapped_greenctx_stream_by_value as _impl
+
+        return _impl(*args, **kwargs)
+
+    def create_asymmetric_overlapped_greenctx_stream_by_value(*args, **kwargs):
+        from sgl_kernel.spatial import (
+            create_asymmetric_overlapped_greenctx_stream_by_value as _impl,
+        )
+
+        return _impl(*args, **kwargs)
+
     def get_sm_available(*args, **kwargs):
         from sgl_kernel.spatial import get_sm_available as _impl
 

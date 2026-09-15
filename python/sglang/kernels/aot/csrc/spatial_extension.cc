@@ -24,6 +24,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
   m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
+  m.def("create_overlapped_greenctx_stream_by_value(int reserved_sm, int device) -> int[]");
+  m.impl("create_overlapped_greenctx_stream_by_value", &create_overlapped_greenctx_stream_by_value);
+  m.def(
+      "create_asymmetric_overlapped_greenctx_stream_by_value(int prefill_reserved_sm, int decode_reserved_sm, int "
+      "device) -> int[]");
+  m.impl(
+      "create_asymmetric_overlapped_greenctx_stream_by_value", &create_asymmetric_overlapped_greenctx_stream_by_value);
 }
 
 REGISTER_EXTENSION(spatial_ops)

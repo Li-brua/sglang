@@ -113,6 +113,73 @@ YAML
 OVERLAY=(--sm-group-num 4 --pdmux-config-path /tmp/pdmux_overlay.yaml)
 ```
 
+Protected overlay (opt-in). Both lanes still use the shared remainder, while
+each lane gets an exclusive SM floor. The decode green-context stream keeps
+high priority on the shared SMs but cannot run on prefill's reserved SMs.
+`overlap_prefill_reserved_sm: 0` (the default) keeps the original full-device
+decode overlay. If `overlap_decode_reserved_sm` is omitted, it inherits the
+prefill reservation for compatibility. A portable symmetric configuration is:
+
+```bash
+cat > /tmp/pdmux_protected_overlay.yaml <<'YAML'
+sm_group_num: 3
+overlap_decode_full_sm: true
+overlap_prefill_reserved_sm: 28
+manual_divisions:
+  - [0, 0, 1]
+YAML
+PROTECTED_OVERLAY=(--sm-group-num 3 --pdmux-config-path /tmp/pdmux_protected_overlay.yaml)
+```
+
+The protected layout uses the AOT `sgl_kernel.spatial` operator when available.
+An older prebuilt kernel wheel automatically falls back to a small cached JIT
+extension that compiles only the green-context host code; a full kernel rebuild
+is not required. The first scheduler process compiles it and the other local TP
+ranks reuse the cache. `SGLANG_CRASH_ON_JIT_COMPILE=1` disables this fallback.
+
+To use the AOT path instead, rebuild/install the kernel wheel explicitly:
+
+```bash
+cd /sgl-workspace/sglang/python/sglang/kernels/aot
+make build MAX_JOBS=8
+python3 -c 'import sgl_kernel.spatial as s; print(s.__file__); print(hasattr(s, "create_overlapped_greenctx_stream_by_value"))'
+```
+
+The last command must print `True`. Rebuild inside every container or node that
+runs a scheduler, then restart all server processes.
+
+In protected mode the first two `manual_divisions` columns are ignored because
+the reservations and detected device size determine both lane sizes; only the
+decode batch threshold is used. CUDA can round each 28-SM floor upward to its
+supported partition granularity. On a 132-SM GPU, if it rounds to 32, the actual
+layout is 32 prefill-only, 68 shared, and 32 decode-only SMs (100 SMs reachable
+by each lane). The startup log prints the actual layout and lane SM counts.
+Compare P90 TTFT, TPOT, and
+total throughput with the original overlay before choosing a production floor.
+
+The floors can also be asymmetric. This example reserves 8 SMs that decode
+cannot use and 24 SMs that prefill cannot use. On a 132-SM GPU, the remaining
+100 SMs are shared, so prefill can reach 108 SMs and decode can reach 124 SMs.
+On a 148-SM GPU, 116 SMs are shared, so the lane totals are 124 and 140. Zeroes
+make the ignored SM columns explicit and allow the same configuration to run
+on either device:
+
+```yaml
+sm_group_num: 3
+overlap_decode_full_sm: true
+overlap_prefill_reserved_sm: 8
+overlap_decode_reserved_sm: 24
+split_forward_token_budget: 65536
+manual_divisions:
+  - [0, 0, 1]
+```
+
+On Hopper, asymmetric reservations must be expressible using the device's
+8-SM partition alignment. The decode stream has priority `-1` and the prefill
+stream priority `0`, so decode is preferred when both have runnable kernels on
+the 100 shared SMs. Stream priority does not interrupt a kernel that is already
+running.
+
 One cell of the matrix, written out. The server runs in the background here
 (or launch it in its own terminal); the readback only makes sense once it is
 up:
