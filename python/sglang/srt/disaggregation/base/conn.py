@@ -27,7 +27,9 @@ class StateType(str, enum.Enum):
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
-    # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
+    # DeepSeek-V4 request-scoped compression state. Keep the official name and
+    # the newer descriptive spelling as aliases of the same wire value.
+    C128_STATE = "c128_state"
     DSV4_REQUEST_STATE = "c128_state"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the

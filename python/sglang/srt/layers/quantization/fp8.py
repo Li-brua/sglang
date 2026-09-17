@@ -518,7 +518,11 @@ class Fp8LinearMethod(LinearMethodBase):
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
-            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
+                weight_block_size=self.weight_block_size,
+                act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
+                and self.quant_config.scale_fmt == "ue8m0",
+            )
             if _is_npu and is_npu_arch35() and self.quant_config.scale_fmt != "ue8m0":
                 # The A5 backend expects the ue8m0 weight layout installed by
                 # the arch35 load path; keep plain block-FP8 checkpoints on
@@ -528,6 +532,20 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
+        # A 32-wide-K ue8m0 block checkpoint is representable as MXFP8 and can
+        # use the selected FlashInfer dense backend on Blackwell.
+        self.block_fp8_as_mxfp8 = (
+            not self.use_mxfp8
+            and can_serve_block_fp8_as_mxfp8(
+                self.weight_block_size,
+                getattr(self.quant_config, "scale_fmt", None),
+            )
+        )
+        if self.block_fp8_as_mxfp8:
+            self.mxfp8_dense_backend = resolve_block_fp8_mxfp8_backend()
+            self.w8a8_mxfp8_linear = dispatch_block_fp8_mxfp8_linear(
+                self.mxfp8_dense_backend
+            )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )

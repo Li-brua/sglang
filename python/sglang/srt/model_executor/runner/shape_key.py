@@ -20,6 +20,12 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class ShapeKey:
+    """Identify one capture shape and its independent execution variants.
+
+    ``attention_variant`` composes DSA dense/sparse selection and DSV4.1
+    candidate-indexer variants with the existing LoRA/PDMux variant label.
+    """
+
     # Tokens for prefill/ragged verify; requests for ordinary decode.
     size: int
     # PDMux stream, or None for a single stream.

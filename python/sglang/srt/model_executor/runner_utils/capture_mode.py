@@ -77,6 +77,19 @@ def _set_capture_attention_variant(variant: Optional[str]) -> None:
     _capture_attention_variant = variant
 
 
+def get_capture_dsa_variant() -> Optional[str]:
+    """Compatibility alias for the generic attention capture variant."""
+    return get_capture_attention_variant()
+
+
+def skip_low_ratio_indexer(compress_ratio: int) -> bool:
+    """Whether this captured variant selects every position for this ratio."""
+    variant = get_capture_attention_variant()
+    return variant == "candidate_all" or (
+        variant == "candidate_c2_all" and compress_ratio == 2
+    )
+
+
 @contextmanager
 def model_capture_mode():
     global is_capture_mode

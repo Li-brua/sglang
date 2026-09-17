@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
@@ -160,6 +159,18 @@ def _router_triton_kernel(
         bias_alt = tl.load(
             bias_alt_ptr + offs_n * stride_bias_alt, mask=mask_n, other=0.0
         ).to(tl.float32)
+
+    live_m = mask_m
+    if HAS_PADDING:
+        live_m = live_m & (offs_m < tl.load(num_token_non_padded_ptr))
+    row_bias = bias[None, :]
+    if HAS_TOKEN_BIAS:
+        input_ids = tl.load(
+            input_ids_ptr + offs_m * stride_input_ids, mask=live_m, other=0
+        )
+        row_bias = tl.where(
+            (input_ids == BIAS_ALT_TOKEN_ID)[:, None], bias_alt[None, :], row_bias
+        )
 
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = live_m[:, None] & mask_n[None, :]

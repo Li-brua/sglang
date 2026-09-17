@@ -387,6 +387,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            _get_packed_topk_ids_for_flashinfer_routed,
+        )
+
+        # The sqrtsoftplus router can emit FlashInfer's packed ids directly;
+        # standard routers are packed here by the shared helper.
+        packed_topk = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
+
         precision = self.flashinfer_mxfp4_moe_precision
         input_ready: Optional[torch.cuda.Event] = None
         if precision == "bf16":
@@ -444,8 +452,13 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     device=x_quant.device,
                 )
 
-        output = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=(topk_ids, topk_weights),
+        if input_ready is not None:
+            # The routed op launches its routing kernel before the GEMMs, so
+            # join the side-stream quantization before entering the op.
+            torch.cuda.current_stream().wait_event(input_ready)
+
+        result = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=packed_topk,
             routing_bias=None,
             hidden_states=x_quant,
             hidden_states_scale=x_scale,
@@ -462,7 +475,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=topk_ids.shape[1],
+            top_k=packed_topk.shape[1],
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,

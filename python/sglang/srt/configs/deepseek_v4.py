@@ -1,11 +1,9 @@
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import Dict, List, Optional
 
 from transformers import PretrainedConfig
-
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +42,6 @@ def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
     return None
 
 
-@dataclass(kw_only=True)
 class DeepSeekV4Config(PretrainedConfig):
     architectures: List[str]
     attention_bias: bool = False
@@ -79,7 +76,7 @@ class DeepSeekV4Config(PretrainedConfig):
     qk_nope_head_dim: int = 448
     qk_rope_head_dim: int = 64
 
-    quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig)
+    quantization_config: Dict[str, object] = field(default_factory=dict)
 
     rms_norm_eps: float = 1e-6
 

@@ -930,10 +930,15 @@ DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
     """The operator's --swa-full-tokens-ratio, or None if it is still the default."""
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.runtime_context import get_server_args
 
-    ratio = get_schedule().swa_full_tokens_ratio
-    return None if ratio == ServerArgs.swa_full_tokens_ratio else ratio
+    server_args = get_server_args()
+    raw_input = getattr(server_args, "_raw_input", None)
+    if raw_input is not None:
+        return raw_input.get("swa_full_tokens_ratio")
+    # Partial fixtures that bypass resolution have no raw snapshot; in that
+    # case the record value is the only operator input available.
+    return getattr(server_args, "swa_full_tokens_ratio", None)
 
 
 @dataclass
@@ -982,8 +987,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
+        self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
+        self.swa_ratio = (
+            self.operator_swa_ratio
+            if self.operator_swa_ratio is not None
+            else DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO
+        )
         self.sliding_window_size = kvc.sliding_window_size
-        self.swa_ratio = get_schedule().swa_full_tokens_ratio
+        self.page_size = kvc.page_size
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.attn_dp_size = kvc.ps.attn_dp_size
@@ -1091,6 +1102,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             target_layers = self.num_layers_total
             self._spec_infl = (target_layers + draft_layers) / target_layers
             self.bytes_per_full_token *= self._spec_infl
+            self.bytes_per_swa_token *= self._spec_infl
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -1142,12 +1154,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"get_compress_state_ring_size()."
             )
 
-    def _get_bytes_per_full_token(self) -> float:
-        if self._unified:
-            # Unified_kv stores the whole latent in bf16.
-            kv_bytes = self.attn_head_dim * 2
-        else:
-            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+    def _resolve_swa_prefix_tails(self) -> int:
+        """Cached prefix tails cap mode keeps addressable in the SWA pool.
 
         A radix-cached prefix is reusable only while its last sliding_window
         tokens still hold SWA slots, so SWA capacity bounds how many cached
@@ -1211,6 +1219,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
     def _get_bytes_per_full_token(self) -> float:
+        if self._unified:
+            # Unified_kv stores the whole latent in bf16.
+            kv_bytes = self.attn_head_dim * 2
+        else:
+            kv_bytes = self.kv_bytes
+
         _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
         # Online c128 stores (max, sum, kv) per slot (3*head_dim) instead of
         # raw (kv, score) (2*head_dim). Combined with ring_size=1 this still
@@ -1226,58 +1240,44 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
         # Cap mode holds swa_tokens fixed, so the SWA pool and the c4 state that
         # follows it become bias bytes (_get_swa_fixed_bytes) instead of coeff.
-        swa_ratio = 0 if self.swa_cap_tokens is not None else self.swa_ratio
+        # Unified KV keeps SWA and C4 state request-scoped as fixed pools too.
+        swa_ratio = (
+            0
+            if self._unified or self.swa_cap_tokens is not None
+            else self.swa_ratio
+        )
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            # Ring mode: SWA is a fixed per-request pool (see _fixed_swa_bytes).
-            (
-                0.0
-                if self._unified
-                else self.swa_ratio * kv_bytes * self.num_layers_total
-            )
+            swa_ratio * self.bytes_per_swa_token
+            + self.low_ratio_bytes_per_full_token
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
-            # Ring mode: C4 state is per-request too (see _fixed_c4_state_bytes).
-            + (
-                0.0
-                if self._unified
-                else self.swa_ratio
-                * c4_state_ratio
-                * c4_state_bytes
-                * self.num_layers_ca4
-            )
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
-            + (
-                0.0
-                if self._unified
-                else self.swa_ratio
-                * c4_state_ratio
-                * c4_indexer_state_bytes
-                * self.num_layers_ca4
-            )
         )
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes the SWA pool takes in cap mode; 0 when sizing by ratio."""
+        swa_cap_tokens = getattr(self, "swa_cap_tokens", None)
         paged_bytes = (
             0
-            if self.swa_cap_tokens is None
-            else self.swa_cap_tokens * self.bytes_per_swa_token
+            if self._unified or swa_cap_tokens is None
+            else swa_cap_tokens * self.bytes_per_swa_token
         )
-        return self.request_window_bytes + paged_bytes
+        return getattr(self, "request_window_bytes", 0) + paged_bytes
 
     def _get_swa_tokens(self, full_token: int, page_size: int) -> int:
         # swa_cap_tokens was page-aligned at resolve time; page_size here is the
         # same get_schedule().page_size that self.page_size holds.
-        if self.swa_cap_tokens is None:
+        swa_cap_tokens = getattr(self, "swa_cap_tokens", None)
+        if swa_cap_tokens is None:
             return int(full_token * self.swa_ratio) // page_size * page_size
-        return self.swa_cap_tokens
+        return swa_cap_tokens
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
-        swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        swa_tokens = self._get_swa_tokens(full_token, page_size)
         if not self._unified:
             # Ring mode: the paged SWA pool is vestigial, so its floor does not apply.
             self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
@@ -1417,16 +1417,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_state_fixed_bytes = self._fixed_c4_state_bytes(
             max_running_requests_per_worker
         )
+        swa_cap_fixed_bytes = self._get_swa_fixed_bytes()
 
         available_bytes_for_tokens = max(
             available_bytes
             - c128_state_fixed_bytes
             - swa_ring_fixed_bytes
-            - c4_state_fixed_bytes,
+            - c4_state_fixed_bytes
+            - swa_cap_fixed_bytes,
             0,
         )
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
         if full_token <= 0 and self.swa_cap_tokens is not None:
+            swa_fixed_bytes = swa_ring_fixed_bytes + swa_cap_fixed_bytes
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "
                 f"{swa_fixed_bytes / (1 << 30):.2f} GB) leaves no room for the full "
@@ -1442,6 +1445,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
+            f"swa_cap_fixed={swa_cap_fixed_bytes / (1 << 30):.2f} GB, "
             f"c4_state_fixed={c4_state_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )

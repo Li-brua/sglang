@@ -196,7 +196,7 @@ class PagedIndexerMetadata:
 
     def row_chunks(self):
         """(rows, plan) per logits chunk; one chunk when row_chunk is 0."""
-        num_rows = self.c4_seq_lens.shape[0]
+        num_rows = self.compressed_seq_lens.shape[0]
         if self.row_chunk <= 0:
             return [(slice(0, num_rows), self.deep_gemm_metadata)]
         return [
@@ -220,6 +220,9 @@ class PagedIndexerMetadata:
             check_eq_fields=[
                 "page_size",
                 "compressed_page_size",
+                "compress_ratio",
+                "index_page_size",
+                "row_chunk",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",

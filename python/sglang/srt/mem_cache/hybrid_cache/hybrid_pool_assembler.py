@@ -578,6 +578,9 @@ def _dsv4_low_ratio_entries(kvcache: Any, page_size: int, num_host_pages: int):
     import torch
 
     entries = []
+    sources_by_ratio = getattr(kvcache, "sources_by_ratio", {})
+    if not any(sources_by_ratio.get(ratio) for ratio in (1, 2)):
+        return entries
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     for ratio, names in (
         (
@@ -597,7 +600,7 @@ def _dsv4_low_ratio_entries(kvcache: Any, page_size: int, num_host_pages: int):
             ),
         ),
     ):
-        sources = getattr(kvcache, "sources_by_ratio", {}).get(ratio, [])
+        sources = sources_by_ratio.get(ratio, [])
         if not sources:
             continue
         kv_pool = kvcache.kv_pools[ratio]
@@ -672,7 +675,7 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = layer_mappings.full
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
-    has_paged_swa = kvcache.swa_kv_pool is not None
+    has_paged_swa = getattr(kvcache, "swa_kv_pool", None) is not None
     mtp_swa_device_buffers = []
     if not has_paged_swa:
         # Unified KV and encoder replay rebuild request-local SWA state;
@@ -1441,9 +1444,18 @@ class _DeepSeekV4Strategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-        return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components in (
+        if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+            return False
+        return components in (
             {ComponentType.FULL, ComponentType.SWA},
             {ComponentType.FULL, ComponentType.SWA, ComponentType.C128},
+        ) or (
+            kvcache.swa_kv_pool is None
+            and components
+            in (
+                {ComponentType.FULL},
+                {ComponentType.FULL, ComponentType.C128},
+            )
         )
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
@@ -1493,6 +1505,12 @@ class _DeepSeekV4Strategy(StackStrategy):
         # NPU drives C128 as an independent tree component, so adding a KV-derived
         # sidecar would duplicate transfers. Add that sidecar only on GPU.
         _sidecar_srcs = [
+            (PoolName.DEEPSEEK_V4_C1, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C1_INDEXER, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C2, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C2_INDEXER, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV),

@@ -119,6 +119,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_hip,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -301,8 +302,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
+        enable_dsv41_candidates = (
+            self.capture_forward_mode == ForwardMode.DECODE
+            and model_runner.device == "cuda"
+            and not is_hip()
+            and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        )
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
-            create_attention_graph_variants(model_runner.model_config.hf_config)
+            create_attention_graph_variants(
+                model_runner.model_config.hf_config,
+                enable_dsv41_candidates=enable_dsv41_candidates,
+            )
         )
 
         # --- bucket sizes ---------------------------------------------
@@ -1017,7 +1027,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
+            num_token_non_padded=(
+                buffers.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
