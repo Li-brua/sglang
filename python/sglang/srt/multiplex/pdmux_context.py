@@ -122,9 +122,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         raise ValueError(
             "overlap_decode_reserved_sm requires a positive overlap_prefill_reserved_sm"
         )
-    layer_prefill_chunk_round_robin = raw.get(
-        "layer_prefill_chunk_round_robin", False
-    )
+    layer_prefill_chunk_round_robin = raw.get("layer_prefill_chunk_round_robin", False)
     if not isinstance(layer_prefill_chunk_round_robin, bool):
         raise ValueError("layer_prefill_chunk_round_robin must be a boolean")
 

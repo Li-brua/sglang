@@ -8,6 +8,7 @@ from torch.cuda.streams import ExternalStream
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.jit.utils.compile.toolchain import cuda_home
 
+
 @cache_once
 def _jit_module():
     cuda_root = cuda_home()

@@ -3901,8 +3901,7 @@ class Scheduler(
         # to refresh prefix/cache metadata used by admission.
         pdmux_chunk_round_robin_order = (
             list(self.waiting_queue)
-            if self.enable_pdmux
-            and self._pdmux_layer_chunk_round_robin_enabled()
+            if self.enable_pdmux and self._pdmux_layer_chunk_round_robin_enabled()
             else None
         )
         self.policy.calc_priority(
@@ -3911,9 +3910,7 @@ class Scheduler(
             processed_tokens=self.processed_tokens_counter,
         )
         if pdmux_chunk_round_robin_order is not None:
-            self._pdmux_restore_chunk_round_robin_order(
-                pdmux_chunk_round_robin_order
-            )
+            self._pdmux_restore_chunk_round_robin_order(pdmux_chunk_round_robin_order)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4427,9 +4424,7 @@ class Scheduler(
             batch_result.extra_keep_alive_refs = keep_alive
 
             if batch.spec_algorithm.is_none():
-                self._relay_forward_payload(
-                    batch, batch.req_pool_indices, batch_result
-                )
+                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
 
             batch_result.copy_done = self.device_module.Event()
             self._launch_result_copy(

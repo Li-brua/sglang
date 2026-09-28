@@ -98,8 +98,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         cls = next(
             node
             for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "SchedulerDPAttnAdapter"
+            if isinstance(node, ast.ClassDef) and node.name == "SchedulerDPAttnAdapter"
         )
         method = next(
             node
@@ -123,8 +122,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         dataclass_fields = {
             node.target.id
             for node in cls.body
-            if isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
         }
         self.assertNotIn("tp_group", dataclass_fields)
 
@@ -397,9 +395,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             stream_groups=[(f"p{i}", f"d{i}") for i in range(group_num)],
         )
         scheduler._update_decode_attn_backends = lambda stream_idx: (
-            SchedulerMultiplexMixin._update_decode_attn_backends(
-                scheduler, stream_idx
-            )
+            SchedulerMultiplexMixin._update_decode_attn_backends(scheduler, stream_idx)
         )
         return scheduler
 
@@ -730,9 +726,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         running_batch = Mock()
         scheduler = SimpleNamespace(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[waiting_req],
             tree_cache=object(),
             running_batch=running_batch,
@@ -770,9 +764,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
         scheduler = SimpleNamespace(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=False
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=False),
             waiting_queue=[object()],
             chunked_req=chunked_req,
         )
@@ -788,9 +780,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
         scheduler = SimpleNamespace(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[],
             chunked_req=chunked_req,
         )
@@ -806,9 +796,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
         scheduler = SimpleNamespace(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[object()],
             tree_cache=SimpleNamespace(disable=True),
             chunked_req=chunked_req,
@@ -830,9 +818,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
         scheduler = SimpleNamespace(
             pdmux_standard=True,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[object()],
             chunked_req=chunked_req,
         )
@@ -846,9 +832,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
     def test_chunk_round_robin_restores_fifo_after_policy_sort(self):
         first, second, continuation = object(), object(), object()
-        scheduler = SimpleNamespace(
-            waiting_queue=[continuation, second, first]
-        )
+        scheduler = SimpleNamespace(waiting_queue=[continuation, second, first])
 
         SchedulerMultiplexMixin._pdmux_restore_chunk_round_robin_order(
             scheduler, [first, second, continuation]
