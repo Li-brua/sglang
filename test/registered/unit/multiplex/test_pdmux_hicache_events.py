@@ -66,6 +66,9 @@ class _DecodeBatch:
     def is_empty(self):
         return False
 
+    def batch_size(self):
+        return 1
+
     def merge_batch(self, other):
         pass
 
@@ -153,7 +156,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
     def on_idle(self):
         pass
 
-    def adjust_stream_groups(self, running_batch):
+    def adjust_stream_groups(self, decode_batch):
         return 0, self.stream_groups[0]
 
     def run_batch(self, batch):
@@ -206,6 +209,35 @@ def _run_loop(*, max_iterations, query_results, pump_interval=1):
 
 
 class TestPDMuxHiCacheEvents(unittest.TestCase):
+    def test_stream_switch_uses_synced_idle_decode_participant(self):
+        scheduler = _FakeScheduler(max_iterations=1, query_results=[])
+        scheduler.stream_groups.append(scheduler.stream_groups[0])
+        scheduler.sm_counts.append((1, 1))
+        local_idle = SimpleNamespace(is_empty=lambda: True)
+        peer_decode = SimpleNamespace(scheduler_global_num_tokens=[0, 1])
+        scheduler.running_batch = local_idle
+        prepare = Mock(
+            side_effect=lambda batch: peer_decode if batch is None else batch
+        )
+        scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch = prepare
+        scheduler.adjust_stream_groups = Mock(
+            return_value=(1, scheduler.stream_groups[1])
+        )
+        scheduler.on_idle = Mock()
+
+        with _stubbed_cuda():
+            with self.assertRaises(_LoopFinished):
+                scheduler.event_loop_pdmux()
+
+        self.assertIs(
+            scheduler.adjust_stream_groups.call_args.kwargs["decode_batch"],
+            peer_decode,
+        )
+        # One existing sync for the prefill batch and one for decode; the
+        # stream decision must not introduce another DP collective.
+        self.assertEqual(prepare.call_count, 2)
+        scheduler.on_idle.assert_not_called()
+
     def test_every_iteration_pumps_hicache_events_exactly_once(self):
         """At interval 1, one pump per iteration across all formation states.
 
