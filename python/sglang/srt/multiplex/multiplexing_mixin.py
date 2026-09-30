@@ -48,13 +48,24 @@ class SchedulerMultiplexMixin:
             f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
         )
 
+    @staticmethod
+    def _global_decode_size(decode_batch: Optional[ScheduleBatch]) -> int:
+        if decode_batch is None:
+            return 0
+        # The DP sync creates IDLE participants and publishes the same vector
+        # on every rank. Local batch sizes cannot select a shared stream group.
+        global_num_tokens = getattr(decode_batch, "scheduler_global_num_tokens", None)
+        if global_num_tokens is not None:
+            return max(global_num_tokens, default=0)
+        return 0 if decode_batch.is_empty() else decode_batch.batch_size()
+
     # TODO(jason-fxz): This is a temporary demo
     def adjust_stream_groups(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler, decode_batch: Optional[ScheduleBatch]
     ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
         """Pick the stream group for the next step."""
-        if not running_batch.is_empty() and self.split_prefill_batch is not None:
-            decode_bs = running_batch.batch_size()
+        decode_bs = SchedulerMultiplexMixin._global_decode_size(decode_batch)
+        if decode_bs > 0 and self.split_prefill_batch is not None:
             manual_divisions = self.pdmux_config.manual_divisions
             if manual_divisions:
                 # A decode batch under every configured threshold still has to
@@ -76,7 +87,7 @@ class SchedulerMultiplexMixin:
                     ),
                 )
             set_current_stream_idx(stream_idx)
-        elif not running_batch.is_empty():
+        elif decode_bs > 0:
             set_current_stream_idx(self.real_sm_group_num - 1)
         else:
             set_current_stream_idx(0)
@@ -404,17 +415,27 @@ class SchedulerMultiplexMixin:
                     decode_stream.wait_event(formation_done)
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
-                adjust_stream_group = adjust_stream_group or (
-                    stream_idx > 0 and running_batch.is_empty()
+                # Gather DP metadata before selecting streams: an empty local
+                # decode batch may still have active peers and run an IDLE
+                # participant. This is the existing gather, moved ahead of the
+                # stream switch so every rank makes the same decision.
+                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    running_batch if not running_batch.is_empty() else None
                 )
-                if running_batch.is_empty() and self.split_prefill_batch is None:
+                has_decode = (
+                    SchedulerMultiplexMixin._global_decode_size(decode_batch) > 0
+                )
+                adjust_stream_group = adjust_stream_group or (
+                    stream_idx > 0 and not has_decode
+                )
+                if not has_decode and self.split_prefill_batch is None:
                     self.on_idle()
 
             if adjust_stream_group:
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
                 stream_idx, stream_group = self.adjust_stream_groups(
-                    running_batch=running_batch,
+                    decode_batch=decode_batch,
                 )
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
@@ -425,9 +446,6 @@ class SchedulerMultiplexMixin:
 
             with torch.cuda.stream(decode_stream):
                 # process decode batch
-                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                    running_batch if not running_batch.is_empty() else None
-                )
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
                     decode_done = True

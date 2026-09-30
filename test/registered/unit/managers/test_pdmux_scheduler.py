@@ -190,11 +190,11 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler = self._make_stream_group_scheduler(
             manual_divisions=[[128, 0, 8]], group_num=3
         )
-        running_batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 1)
+        decode_batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 1)
 
         with self._stubbed_stream_idx():
             stream_idx, stream_group = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, running_batch
+                scheduler, decode_batch
             )
 
         self.assertEqual(stream_idx, 1)
@@ -204,14 +204,66 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler = self._make_stream_group_scheduler(
             manual_divisions=[[32, 0, 1], [64, 0, 8]], group_num=4
         )
-        running_batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 12)
+        decode_batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 12)
 
         with self._stubbed_stream_idx():
             stream_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, running_batch
+                scheduler, decode_batch
             )
 
         self.assertEqual(stream_idx, 2)
+
+    def test_idle_decode_rank_uses_peer_stream_group(self):
+        scheduler = self._make_stream_group_scheduler(
+            manual_divisions=[[104, 0, 0]], group_num=3
+        )
+        active = SimpleNamespace(
+            is_empty=lambda: False,
+            batch_size=lambda: 2,
+            scheduler_global_num_tokens=[2, 0],
+        )
+        idle = SimpleNamespace(
+            is_empty=lambda: True,
+            batch_size=lambda: 0,
+            scheduler_global_num_tokens=[2, 0],
+        )
+
+        with self._stubbed_stream_idx():
+            active_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
+                scheduler, active
+            )
+            idle_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(scheduler, idle)
+
+        self.assertEqual(active_idx, 1)
+        self.assertEqual(idle_idx, active_idx)
+
+        idle.scheduler_global_num_tokens = [0, 0]
+        with self._stubbed_stream_idx():
+            no_decode_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
+                scheduler, idle
+            )
+        self.assertEqual(no_decode_idx, 0)
+
+    def test_manual_division_uses_global_decode_size(self):
+        scheduler = self._make_stream_group_scheduler(
+            manual_divisions=[[32, 0, 1], [64, 0, 8]], group_num=4
+        )
+        batches = [
+            SimpleNamespace(
+                is_empty=lambda size=local_size: size == 0,
+                batch_size=lambda size=local_size: size,
+                scheduler_global_num_tokens=[2, 12, 0],
+            )
+            for local_size in (2, 12, 0)
+        ]
+
+        with self._stubbed_stream_idx():
+            indices = [
+                SchedulerMultiplexMixin.adjust_stream_groups(scheduler, batch)[0]
+                for batch in batches
+            ]
+
+        self.assertEqual(indices, [2, 2, 2])
 
     def test_split_prefill_forward_installs_hicache_consumer_first(self):
         """Every split-prefill segment must install the HiCache consumer index
