@@ -171,6 +171,9 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if req.skip_radix_cache_insert:
+        pool = tree_cache.req_to_token_pool
+        if isinstance(pool, HybridReqToTokenPool):
+            pool.release_mamba_cache_reservation(req)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
@@ -293,6 +296,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     """Give the request's kv row back; with ``is_insert`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    pool = tree_cache.req_to_token_pool
+    if isinstance(pool, HybridReqToTokenPool):
+        pool.release_mamba_prefill_slots(req)
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (

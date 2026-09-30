@@ -579,6 +579,10 @@ class SchedulerDisaggregationPrefillMixin:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req, chunked=chunked)
+            if release := getattr(
+                cache.req_to_token_pool, "release_mamba_cache_reservation", None
+            ):
+                release(req)
             return
 
         maybe_cache_unfinished_req(req, cache, chunked=chunked)
