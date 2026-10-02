@@ -11,6 +11,7 @@ from torch import nn
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.glm5_next import (
+    Glm5NextDecoderLayer,
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
 )
@@ -81,6 +82,43 @@ def make_batch():
 
 
 class TestGlm5NextPDMux(unittest.TestCase):
+    def test_decode_helper_is_reset_on_the_next_prefill_slice(self):
+        helper = object()
+        layer = SimpleNamespace(
+            pdmux_alt_stream=helper,
+            is_linear_attn=False,
+            is_layer_sparse=True,
+            self_attn=SimpleNamespace(
+                alt_stream=None,
+                use_dsa=True,
+                indexer=SimpleNamespace(alt_stream=None),
+            ),
+            mlp=SimpleNamespace(alt_stream=None),
+        )
+        with patch(
+            "sglang.srt.models.glm5_next.get_pdmux_decode_alt_stream",
+            return_value=helper,
+        ):
+            for mode, expected in (
+                (ForwardMode.DECODE, helper),
+                (ForwardMode.SPLIT_PREFILL, None),
+                (ForwardMode.IDLE, helper),
+                (ForwardMode.EXTEND, None),
+            ):
+                Glm5NextDecoderLayer._set_pdmux_alt_stream(
+                    layer, SimpleNamespace(forward_mode=mode)
+                )
+                self.assertIs(layer.self_attn.alt_stream, expected)
+                self.assertIs(layer.self_attn.indexer.alt_stream, expected)
+                self.assertIs(layer.mlp.alt_stream, expected)
+
+            # DSA layers that reuse the previous top-k do not own an indexer.
+            layer.self_attn.indexer = None
+            Glm5NextDecoderLayer._set_pdmux_alt_stream(
+                layer, SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            )
+            self.assertIs(layer.self_attn.alt_stream, helper)
+
     def test_idle_dp_rank_skips_split_prefill_attention_plan(self):
         runner = SimpleNamespace(
             attn_backend=Mock(),
