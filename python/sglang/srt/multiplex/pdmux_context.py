@@ -10,6 +10,7 @@ SM_GROUP_NUM = 8  # Default number of SM groups
 CURRENT_STREAM_IDX = 0
 CURRENT_STREAM_GROUP = None
 _RESERVED_GREEN_STREAMS = []
+_FULL_DEVICE_DECODE_STREAMS = set()
 
 _OVERLAP_DECODE_STREAM_PRIORITY = -1
 
@@ -21,6 +22,9 @@ class PDMuxConfig:
         default_factory=list
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
+    # Zero keeps the token-budget-only policy. A positive cap bounds CPU
+    # submission before the next decode step, even for short prefills.
+    max_split_forward_layers: int = 0
     decode_bs_divisor: int = 36
     # Overlap mode: prefill keeps its green-context SM cap while decode runs on
     # plain full-device streams, so the two SM sets deliberately overlap and the
@@ -89,16 +93,24 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         previous_threshold = threshold
 
     split_forward_token_budget = raw.get("split_forward_token_budget", 65536)
+    max_split_forward_layers = raw.get("max_split_forward_layers", 0)
     decode_bs_divisor = raw.get("decode_bs_divisor", 36)
     if split_forward_token_budget <= 0:
         raise ValueError("split_forward_token_budget must be positive")
     if decode_bs_divisor <= 0:
         raise ValueError("decode_bs_divisor must be positive")
+    if (
+        not isinstance(max_split_forward_layers, int)
+        or isinstance(max_split_forward_layers, bool)
+        or max_split_forward_layers < 0
+    ):
+        raise ValueError("max_split_forward_layers must be a non-negative integer")
 
     return PDMuxConfig(
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
         split_forward_token_budget=split_forward_token_budget,
+        max_split_forward_layers=max_split_forward_layers,
         decode_bs_divisor=decode_bs_divisor,
         overlap_decode_full_sm=overlap_decode_full_sm,
     )
@@ -162,7 +174,7 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
         SM_GROUP_NUM, \
         CURRENT_STREAM_IDX, \
         CURRENT_STREAM_GROUP
-    global _RESERVED_GREEN_STREAMS
+    global _RESERVED_GREEN_STREAMS, _FULL_DEVICE_DECODE_STREAMS
     # for pd_multiplexing, Init stream_groups
     device = torch.cuda.current_device()
     total_sm_count = spatial.get_sm_available(gpu_id)
@@ -205,21 +217,21 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     SM_COUNTS.append((0, total_sm_count))  # Normal stream for decode
     STREAM_GROUPS = []
     _RESERVED_GREEN_STREAMS = []
+    _FULL_DEVICE_DECODE_STREAMS = set()
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for prefill
     for prefill_sm, decode_sm in divisions:
         if config.overlap_decode_full_sm:
-            prefill_stream, reserved_stream = (
-                spatial.create_greenctx_stream_by_value(
-                    prefill_sm, total_sm_count - prefill_sm, gpu_id
-                )
+            prefill_stream, reserved_stream = spatial.create_greenctx_stream_by_value(
+                prefill_sm, total_sm_count - prefill_sm, gpu_id
             )
             _RESERVED_GREEN_STREAMS.append(reserved_stream)
             decode_stream = torch.cuda.Stream(
                 gpu_id, priority=_OVERLAP_DECODE_STREAM_PRIORITY
             )
             STREAM_GROUPS.append((prefill_stream, decode_stream))
+            _FULL_DEVICE_DECODE_STREAMS.add(decode_stream.cuda_stream)
         else:
             STREAM_GROUPS.append(
                 (spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id))
@@ -227,6 +239,7 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for decode
+    _FULL_DEVICE_DECODE_STREAMS.add(STREAM_GROUPS[-1][1].cuda_stream)
 
     CURRENT_STREAM_IDX = 0
     CURRENT_STREAM_GROUP = STREAM_GROUPS[CURRENT_STREAM_IDX]
@@ -253,3 +266,17 @@ def get_sm_counts() -> list[tuple[int, int]]:
 def get_current_stream_idx() -> int:
     """Get the current stream index."""
     return CURRENT_STREAM_IDX
+
+
+def get_pdmux_decode_alt_stream(alt_stream):
+    """Allow ordinary helper streams only on a full-device decode lane.
+
+    Inspect the actual stream: graph capture iterates stream groups without
+    changing CURRENT_STREAM_IDX. A helper on a green decode lane would escape
+    the SM partition just as it would on a green prefill lane.
+    """
+    if alt_stream is None:
+        return None
+    if torch.cuda.current_stream().cuda_stream in _FULL_DEVICE_DECODE_STREAMS:
+        return alt_stream
+    return None

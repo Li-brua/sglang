@@ -107,6 +107,7 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multiplex.pdmux_context import get_pdmux_decode_alt_stream
 from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
@@ -685,6 +686,11 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
+        self.enable_pdmux = get_disagg().enable_pdmux
+        self.pdmux_alt_stream = alt_stream
+        if self.enable_pdmux:
+            # Select the helper for each lane at forward time, including capture.
+            alt_stream = None
 
         if self.is_linear_attn:
             self.self_attn = Glm5NextLinearAttention(
@@ -910,6 +916,19 @@ class Glm5NextDecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _set_pdmux_alt_stream(self, forward_batch: ForwardBatch) -> None:
+        alt_stream = (
+            get_pdmux_decode_alt_stream(self.pdmux_alt_stream)
+            if forward_batch.forward_mode.is_decode_or_idle()
+            else None
+        )
+        if not self.is_linear_attn:
+            self.self_attn.alt_stream = alt_stream
+            if self.self_attn.indexer is not None:
+                self.self_attn.indexer.alt_stream = alt_stream
+        if self.is_layer_sparse:
+            self.mlp.alt_stream = alt_stream
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -920,6 +939,8 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        if self.enable_pdmux:
+            self._set_pdmux_alt_stream(forward_batch)
         hidden_states_orig = layer_input_buffer(hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -1000,12 +1021,10 @@ class Glm5NextModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # PDMux places each forward on a Green Context stream; an ordinary
-        # helper stream would escape that SM partition.
+        # Decoder layers enable this helper only for full-device decode lanes.
         self.alt_stream = (
             torch.cuda.Stream()
-            if not get_disagg().enable_pdmux
-            and (
+            if (
                 _is_cuda
                 or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
                 or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()

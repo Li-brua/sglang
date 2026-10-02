@@ -160,9 +160,7 @@ class SchedulerMultiplexMixin:
         # active and IDLE prefill batches. Size segments from its maximum so an
         # IDLE rank (whose local extend_num_tokens is zero) advances by exactly
         # the same layer count as the busiest active rank.
-        global_num_tokens = (
-            self.split_prefill_batch.scheduler_global_num_tokens
-        )
+        global_num_tokens = self.split_prefill_batch.scheduler_global_num_tokens
         prefill_num_tokens = (
             max(global_num_tokens, default=0)
             if global_num_tokens is not None
@@ -173,9 +171,12 @@ class SchedulerMultiplexMixin:
 
         forward_count = max(
             1,
-            self.pdmux_config.split_forward_token_budget
-            // prefill_num_tokens,
+            self.pdmux_config.split_forward_token_budget // prefill_num_tokens,
         )
+        if self.pdmux_config.max_split_forward_layers:
+            forward_count = min(
+                forward_count, self.pdmux_config.max_split_forward_layers
+            )
         return min(forward_count, remaining_layers)
 
     def _merge_finished_prefill_batch(
@@ -277,9 +278,7 @@ class SchedulerMultiplexMixin:
         def ready_on_all_ranks() -> bool:
             flag = torch.tensor(
                 int(
-                    getattr(
-                        getattr(req, "kv", None), "mamba_cache_reserve_slot", None
-                    )
+                    getattr(getattr(req, "kv", None), "mamba_cache_reserve_slot", None)
                     is not None
                     or allocator.schedulable_available_size() >= 1
                 ),

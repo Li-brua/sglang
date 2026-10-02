@@ -20,7 +20,6 @@ SCHEDULER_PATH = (
 TP_WORKER_PATH = SCHEDULER_PATH.parent / "tp_worker.py"
 
 
-
 class _Batch:
     def __init__(self, empty):
         self._empty = empty
@@ -44,10 +43,8 @@ def _make_chunked_req(*, extend_end, prefix_len):
 class TestPDMuxScheduler(unittest.TestCase):
     @staticmethod
     def _bind_merge(scheduler):
-        scheduler._merge_completed_prefill_batch = (
-            lambda **kwargs: SchedulerMultiplexMixin._merge_completed_prefill_batch(
-                scheduler, **kwargs
-            )
+        scheduler._merge_completed_prefill_batch = lambda **kwargs: (
+            SchedulerMultiplexMixin._merge_completed_prefill_batch(scheduler, **kwargs)
         )
         return scheduler
 
@@ -62,7 +59,9 @@ class TestPDMuxScheduler(unittest.TestCase):
     ):
         return SimpleNamespace(
             model_config=SimpleNamespace(num_hidden_layers=61),
-            pdmux_config=SimpleNamespace(split_forward_token_budget=token_budget),
+            pdmux_config=SimpleNamespace(
+                split_forward_token_budget=token_budget, max_split_forward_layers=0
+            ),
             running_batch=_Batch(decode_empty),
             split_prefill_batch=SimpleNamespace(
                 split_index=split_index,
@@ -104,6 +103,20 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
 
         self.assertEqual(count, 2)
+
+    def test_layer_cap_bounds_short_prefill_submission(self):
+        scheduler = self._make_scheduler(decode_empty=False, extend_num_tokens=2048)
+        scheduler.pdmux_config.max_split_forward_layers = 2
+        decode_batch = SimpleNamespace(scheduler_global_num_tokens=[1])
+
+        self.assertEqual(
+            SchedulerMultiplexMixin._get_split_forward_count(scheduler, decode_batch),
+            2,
+        )
+        # Without decode there is no TPOT to protect; finish all remaining layers.
+        self.assertEqual(
+            SchedulerMultiplexMixin._get_split_forward_count(scheduler, None), 61
+        )
 
     def test_prefill_split_count_matches_on_active_and_idle_dp_ranks(self):
         active_scheduler = self._make_scheduler(
@@ -683,9 +696,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             running_batch=running_batch,
         )
         self.assertIs(scheduler._pdmux_pending_chunk_stash_req, chunked_req)
-        batch.filter_batch.assert_called_once_with(
-            chunked_req_to_exclude=[chunked_req]
-        )
+        batch.filter_batch.assert_called_once_with(chunked_req_to_exclude=[chunked_req])
         scheduler.stash_chunked_request.assert_not_called()
 
         created, _ = SchedulerMultiplexMixin.update_split_prefill_batch(
@@ -697,9 +708,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             None
         )
 
-        SchedulerMultiplexMixin.update_split_prefill_batch(
-            scheduler, 1, running_batch
-        )
+        SchedulerMultiplexMixin.update_split_prefill_batch(scheduler, 1, running_batch)
         scheduler.stash_chunked_request.assert_called_once_with(chunked_req)
         scheduler.get_new_batch_prefill.assert_called_once_with(running_batch)
 
