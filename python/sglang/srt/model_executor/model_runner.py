@@ -1785,8 +1785,13 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
-    ) -> LogitsProcessorOutput:
-        if forward_batch.split_index == 0 or reinit_attn_backend:
+    ) -> Optional[LogitsProcessorOutput]:
+        # An idle DP rank still runs every layer to participate in MLP
+        # collectives, but it has no requests or attention work to plan.
+        # DSA's planner reads max(seq_lens_cpu), which is empty on this rank.
+        if not forward_batch.forward_mode.is_idle() and (
+            forward_batch.split_index == 0 or reinit_attn_backend
+        ):
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
             forward_batch.split_index + forward_count,
@@ -1811,7 +1816,7 @@ class ModelRunner:
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
+        split_forward_count: Optional[int] = None,
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -1960,7 +1965,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
+        split_forward_count: Optional[int] = None,
     ) -> ModelRunnerOutput:
         prepare = getattr(self.model, "prepare_for_forward", None)
         if prepare is not None:
@@ -2021,12 +2026,17 @@ class ModelRunner:
             if dwdp_mgr is not None:
                 dwdp_mgr.prefetch_first_layers()
 
-            if forward_batch.forward_mode.is_split_prefill():
+            if (
+                split_forward_count is not None
+                or forward_batch.forward_mode.is_split_prefill()
+            ):
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
-                    forward_count=split_forward_count,
+                    forward_count=(
+                        split_forward_count if split_forward_count is not None else 1
+                    ),
                 )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
@@ -2571,7 +2581,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool,
-        split_forward_count: int,
+        split_forward_count: Optional[int],
     ) -> ModelRunnerOutput:
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
