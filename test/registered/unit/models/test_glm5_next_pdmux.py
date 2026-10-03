@@ -101,7 +101,6 @@ class TestGlm5NextPDMux(unittest.TestCase):
         ):
             for mode, expected in (
                 (ForwardMode.DECODE, helper),
-                (ForwardMode.TARGET_VERIFY, helper),
                 (ForwardMode.SPLIT_PREFILL, None),
                 (ForwardMode.IDLE, helper),
                 (ForwardMode.EXTEND, None),
@@ -210,40 +209,6 @@ class TestGlm5NextPDMux(unittest.TestCase):
         self.assertEqual(len(actual_aux), 1)
         self.assertEqual(model.layers[1].seen_topk[-1].item(), 1)
         self.assertEqual(model.layers[2].seen_topk[-1].item(), 2)
-
-    def test_dspark_aux_features_survive_verify_between_prefill_slices(self):
-        model = make_model()
-        model.dflash_capture = True
-        model.layers_to_capture = [1, 2]
-        batch = make_batch()
-        input_ids = torch.tensor([1, 2])
-        positions = torch.tensor([0, 1])
-        recorder = SimpleNamespace(with_current_layer=lambda i: nullcontext())
-        with (
-            patch(
-                "sglang.srt.models.glm5_next.get_global_expert_distribution_recorder",
-                return_value=recorder,
-            ),
-            patch(
-                "sglang.srt.models.glm5_next.check_cuda_graph_backend",
-                return_value=False,
-            ),
-        ):
-            expected, expected_aux = model.forward(input_ids, positions, make_batch())
-            for start in range(3):
-                actual = model.forward_split_prefill(
-                    input_ids, positions, batch, (start, start + 1)
-                )
-                # A verify forward must not replace the features stored on the
-                # persistent prefill ForwardBatch.
-                verify = make_batch()
-                verify.forward_mode = ForwardMode.TARGET_VERIFY
-                model.forward(torch.tensor([3]), torch.tensor([7]), verify)
-        hidden, aux = actual
-        torch.testing.assert_close(hidden, expected)
-        self.assertEqual(len(aux), 2)
-        for captured, uninterrupted in zip(aux, expected_aux):
-            torch.testing.assert_close(captured, uninterrupted)
 
     def test_multimodal_embedding_runs_only_for_first_segment(self):
         wrapper = Glm5NextForConditionalGeneration.__new__(

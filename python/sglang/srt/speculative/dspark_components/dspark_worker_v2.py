@@ -8,7 +8,6 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed.parallel_state import pdmux_prefill_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -227,14 +226,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             if parallel.enable_dp_attention
             else parallel.tp_group
         )
-        self._prefill_tp_sync = self._tp_sync
-        if get_disagg().enable_pdmux:
-            with pdmux_prefill_tp_group():
-                self._prefill_tp_sync = SpecTpSync(
-                    parallel.attn_tp_group
-                    if parallel.enable_dp_attention
-                    else parallel.tp_group
-                )
         self._draft_graph_group = (
             parallel.attn_tp_group
             if self._draft_dp_context_enabled
@@ -604,35 +595,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
-        return self._finish_prefill(batch, batch_output, on_publish)
-
-    def forward_batch_split_prefill(
-        self, batch: ScheduleBatch
-    ) -> GenerationBatchResult:
-        """Retain target features across PDMux slices; inject only at completion."""
-        if batch.split_index == 0:
-            self._verify_planner.note_non_decode_step()
-            self._observers.note_prefill_step()
-        batch_output = self.target_worker.forward_batch_split_prefill(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
-        )
-        if (
-            batch.split_forward_batch.split_index
-            < self.model_runner.model_config.num_hidden_layers
-        ):
-            return batch_output
-        # IDLE ranks still execute every split layer for DP/MLP collectives,
-        # but have no target features to inject or token decisions to sync.
-        if batch.forward_mode.is_idle():
-            return self._decode_idle_result(on_publish=None)
-        return self._finish_prefill(batch, batch_output, on_publish=None)
-
-    def _finish_prefill(
-        self,
-        batch: ScheduleBatch,
-        batch_output: GenerationBatchResult,
-        on_publish,
-    ) -> GenerationBatchResult:
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
             self._target_hidden_projection_enabled
@@ -643,7 +605,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
-        self._prefill_tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         new_seq_lens = batch.seq_lens
         batch_output.new_seq_lens = new_seq_lens
         if on_publish is not None:
@@ -1037,11 +999,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # layout would need the accept-index mapping the shared spec_utils
         # commit helper does.
         assert get_spec().speculative_eagle_topk in (None, 1)
-        attn_backend = (
-            self.model_runner.decode_attn_backend
-            if get_disagg().enable_pdmux
-            else self.model_runner.attn_backend
-        )
+        attn_backend = self.target_worker.model_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
