@@ -41,6 +41,21 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
 )
 
 
+def check_pdmux_speculative_compat(cfg: Any) -> None:
+    if cfg.speculative_algorithm is None:
+        return
+    assert cfg.speculative_algorithm.upper() in ("EAGLE", "NEXTN"), (
+        "PD-Multiplexing currently supports only single-layer MTP/EAGLE "
+        "speculative decoding."
+    )
+    assert not cfg.enable_multi_layer_eagle, (
+        "PD-Multiplexing does not support multi-layer EAGLE."
+    )
+    assert not cfg.speculative_adaptive, (
+        "PD-Multiplexing requires fixed speculative parameters."
+    )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -190,6 +205,7 @@ def check_server_args(server_args: Any):
 
     # Check pdmux
     if cfg.enable_pdmux:
+        check_pdmux_speculative_compat(cfg)
         assert cfg.pp_size == 1, (
             "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
         )
