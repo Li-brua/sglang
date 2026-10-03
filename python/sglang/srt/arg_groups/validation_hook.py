@@ -35,6 +35,14 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
+def check_pdmux_speculative_compat(cfg: Any) -> None:
+    if cfg.enable_pdmux and cfg.speculative_algorithm not in (None, "DSPARK"):
+        raise ValueError(
+            "PD-Multiplexing currently supports only DSPARK speculative decoding; "
+            f"got {cfg.speculative_algorithm}."
+        )
+
+
 def check_pipeline_parallel_compat(cfg: Any) -> None:
     """Validate features used with pipeline parallelism."""
     assert cfg.disable_overlap_schedule, (
@@ -165,6 +173,7 @@ def check_server_args(server_args: Any):
         )
 
     # Check pdmux
+    check_pdmux_speculative_compat(cfg)
     if cfg.enable_pdmux:
         assert cfg.pp_size == 1, (
             "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
