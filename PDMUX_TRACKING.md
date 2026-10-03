@@ -1,8 +1,8 @@
-# PDMux model integration tracker
+# GLM-5.3-Flash PDMux integration tracker
 
 [Tracking PR #41861](https://github.com/sgl-project/sglang/pull/41861) records
-the implementation dependencies and validation for GLM-5.3-Flash and
-DeepSeek-V4.1-Flash. This document does not change runtime behavior.
+the four GLM-5.3-Flash implementation PRs, their dependencies and validation.
+Related model integrations are linked below for reference.
 
 ## GLM-5.3-Flash: four implementation PRs
 
@@ -65,14 +65,11 @@ MTP launch and validation guidance:
 The first three heads gate speculative decoding; the fourth accepts the
 checkpoint's single-layer EAGLE/NEXTN path and keeps PDMux drafts eager.
 
-## DeepSeek-V4.1-Flash
+## Related integration
 
-[Integration PR #41562](https://github.com/sgl-project/sglang/pull/41562) remains
-the reference for standard prefill, DP attention and DSpark. Its branch and PR
-are retained; this GLM reorganization does not split or rewrite that work.
-
-- [ ] Link focused DeepSeek PRs when the integration is split.
-- [ ] Record TP8 correctness and performance for standard prefill, DP attention and DSpark.
+[DeepSeek-V4.1-Flash PDMux integration #41562](https://github.com/sgl-project/sglang/pull/41562)
+continues as a single independent PR covering standard prefill, DP attention
+and DSpark. Its implementation and validation are tracked in that PR.
 
 ## Merge progress
 
