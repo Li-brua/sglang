@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
@@ -273,9 +273,12 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if not req.skip_radix_cache_insert:
+    if req.skip_radix_cache_insert:
+        pool = tree_cache.req_to_token_pool
+        if isinstance(pool, HybridReqToTokenPool):
+            pool.release_mamba_cache_reservation(req)
+    else:
         tree_cache.checkpoint(req, up_to=req.extend_end)
-    # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
 
 
@@ -396,6 +399,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    pool = tree_cache.req_to_token_pool
+    if isinstance(pool, HybridReqToTokenPool):
+        pool.release_mamba_prefill_slots(req)
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (

@@ -12,6 +12,8 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaSlotExhausted
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,6 +71,44 @@ class TestHostGateCapacity(unittest.TestCase):
         self.assertEqual(allocator.verify_byte_accounting(), [])
         state["open"] = True
         self.assertEqual(full.schedulable_available_size(), before)
+
+
+class TestLoadBackPreparationRollback(unittest.TestCase):
+    def test_mamba_slot_exhaustion_releases_prepared_state_and_locks(self):
+        host_receipt = Mock()
+        device_receipt = Mock()
+        prepared_full = Mock()
+        prepared_full.component_type = ComponentType.FULL
+        prepared_full.prepare_load_back.return_value = object()
+        exhausted_mamba = Mock()
+        exhausted_mamba.component_type = ComponentType.MAMBA
+        exhausted_mamba.prepare_load_back.side_effect = MambaSlotExhausted(
+            "no state slot"
+        )
+        req = object()
+        cache = SimpleNamespace(
+            cache_controller=object(),
+            inc_host_lock_ref=Mock(return_value=host_receipt),
+            inc_lock_ref=Mock(return_value=device_receipt),
+            dec_lock_ref=Mock(),
+            dec_host_lock_ref=Mock(),
+            _components_tuple=(prepared_full, exhausted_mamba),
+            _load_back_transfers=Mock(),
+        )
+
+        with self.assertRaises(MambaSlotExhausted):
+            UnifiedRadixCache.load_back(cache, 7, req=req)
+
+        prepared_full.finalize_load_back.assert_called_once_with(
+            req, prepared_full.prepare_load_back.return_value, False
+        )
+        cache.dec_lock_ref.assert_called_once_with(
+            7, device_receipt.to_dec_params.return_value
+        )
+        cache.dec_host_lock_ref.assert_called_once_with(
+            7, host_receipt.to_dec_params.return_value
+        )
+        cache._load_back_transfers.assert_not_called()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

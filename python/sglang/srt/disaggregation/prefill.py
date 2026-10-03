@@ -584,6 +584,10 @@ class SchedulerDisaggregationPrefillMixin:
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
             req.prefix_len = req.extend_end
+            if release := getattr(
+                cache.req_to_token_pool, "release_mamba_cache_reservation", None
+            ):
+                release(req)
             return
 
         checkpoint_kv_cache(req, cache)

@@ -336,10 +336,33 @@ def alloc_req_slots(
     and should surface rather than be masked.
     """
     num_reqs = len(reqs)
-    # Keep combined serving's existing behavior: try cache eviction, then let
-    # the pool allocate. A failed precheck need not mean allocation will fail.
-    ensure_mamba_capacity(req_to_token_pool, reqs, tree_cache)
-    req_pool_indices = req_to_token_pool.alloc(reqs)
+    if isinstance(req_to_token_pool, HybridReqToTokenPool):
+        # Byte-coordinated for the shared allocator (accounts for the peer full
+        # sub-pool's bytes); plain slot free count for the non-shared one.
+        mamba_available_size = (
+            req_to_token_pool.mamba_allocator.schedulable_available_size()
+        )
+        reserve_cache_slot = tree_cache.supports_mamba() and not getattr(
+            tree_cache, "disable", False
+        )
+        mamba_state_needed = sum(
+            req_to_token_pool.mamba_slots_needed_for_extend(
+                req, reserve_cache_slot=reserve_cache_slot
+            )
+            for req in reqs
+        )
+        if mamba_available_size < mamba_state_needed:
+            if tree_cache is not None and tree_cache.supports_mamba():
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+                tree_cache.evict_for_alloc(
+                    EvictParams(num_tokens=0, mamba_num=mamba_num)
+                )
+    if isinstance(req_to_token_pool, HybridReqToTokenPool):
+        req_pool_indices = req_to_token_pool.alloc(
+            reqs, reserve_mamba_cache_slot=reserve_cache_slot
+        )
+    else:
+        req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
             "alloc_req_slots runs out of memory. "
