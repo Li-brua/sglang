@@ -76,7 +76,11 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
-from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_dp_tp_group,
+    set_dp_buffer_len_from_batch,
+    set_is_extend_in_batch,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -182,6 +186,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1894,7 +1899,8 @@ class ModelRunner:
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                split_forward_count is None
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -1915,13 +1921,36 @@ class ModelRunner:
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+            is_split_prefill = (
+                split_forward_count is not None
+                or forward_batch.forward_mode.is_split_prefill()
+            )
+            retain_split_prefill_padding = (
+                is_split_prefill
+                and forward_batch.global_num_tokens_cpu is not None
+                and get_disagg().enable_pdmux
+                and not self.is_draft_worker
+                and forward_batch.spec_info is None
+                and (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark())
+                and self.lora_manager is None
+                and self.hisparse_coordinator is None
+            )
+
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
             # early; split prefill, the prefill cuda graph, and the eager
             # forward all run the live batch and need this first — it sets
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
-            self._prepare_eager_forward_batch(forward_batch)
+            if retain_split_prefill_padding and forward_batch.split_index > 0:
+                # The same batch resumes with fixed shapes. Decode has replaced
+                # the process-wide DP metadata, but the prepared tensors and
+                # device token counts still belong to this prefill. Restore the
+                # metadata without padding/copying those inputs again.
+                set_dp_buffer_len_from_batch(forward_batch)
+                set_is_extend_in_batch(forward_batch.is_extend_in_batch)
+            else:
+                self._prepare_eager_forward_batch(forward_batch)
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
@@ -1931,18 +1960,13 @@ class ModelRunner:
             if dwdp_mgr is not None:
                 dwdp_mgr.prefetch_first_layers()
 
-            if (
-                split_forward_count is not None
-                or forward_batch.forward_mode.is_split_prefill()
-            ):
+            if is_split_prefill:
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
                     forward_count=(
-                        split_forward_count
-                        if split_forward_count is not None
-                        else 1
+                        split_forward_count if split_forward_count is not None else 1
                     ),
                 )
             elif (
@@ -1979,6 +2003,10 @@ class ModelRunner:
             if (
                 forward_batch.global_num_tokens_cpu is not None
                 and self.pp_group.is_last_rank
+                and (
+                    not retain_split_prefill_padding
+                    or forward_batch.split_index == self.model_config.num_hidden_layers
+                )
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 

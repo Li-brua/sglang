@@ -1198,6 +1198,25 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         eagle_prepare_for_decode(batch)
 
 
+@contextmanager
+def pdmux_prefill_handoff():
+    """Serialize final draft scratch use with the preceding and next decode."""
+    from sglang.srt.multiplex.pdmux_context import (
+        get_current_stream_idx,
+        get_stream_groups,
+    )
+
+    prefill_stream, decode_stream = get_stream_groups()[get_current_stream_idx()]
+    prefill_stream.wait_stream(decode_stream)
+    try:
+        yield
+    finally:
+        # Completion polling can submit another decode before merging this
+        # prefill. Publish its draft/injection work now, while keeping all
+        # intermediate target slices free of this dependency.
+        decode_stream.wait_event(prefill_stream.record_event())
+
+
 def get_plan_stream(
     device: str,
 ) -> Tuple[Any, contextlib.AbstractContextManager]:

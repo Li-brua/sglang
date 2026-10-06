@@ -10,6 +10,7 @@ Pure dataclass logic — CPU only.
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,20 +18,28 @@ import torch
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers import dp_attention
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
-from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_forward, get_parallel
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -285,9 +294,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         fb.post_forward_mlp_sync_batch(None)
 
         self.assertEqual(fb.batch_size, 2)
-        torch.testing.assert_close(
-            fb.positions, torch.tensor([0, 1, 2, 0, 1, 2, 3])
-        )
+        torch.testing.assert_close(fb.positions, torch.tensor([0, 1, 2, 0, 1, 2, 3]))
         torch.testing.assert_close(fb.seq_lens, torch.tensor([3, 4]))
         torch.testing.assert_close(fb.req_pool_indices, torch.tensor([1, 2]))
 
@@ -397,6 +404,373 @@ class TestDraftScopeMlpSync(CustomTestCase):
         self.assertEqual(fb.global_num_tokens_cpu, [9, 9, 9, 9])
         self._assert_token_rows(fb, rows=9)
         torch.testing.assert_close(fb.mm_input_embeds[6:], torch.zeros(3, self.HIDDEN))
+
+
+class TestPDMuxMlpSync(CustomTestCase):
+    def test_split_prefill_retains_padding_across_decode_steps(self):
+        for dp_size in (8, 2):
+            with self.subTest(dp_size=dp_size):
+                self._check_split_prefill_reuse(SpeculativeAlgorithm.NONE, dp_size)
+
+    def test_dspark_split_prefill_retains_padding_across_decode_steps(self):
+        for dp_size in (8, 2):
+            with self.subTest(dp_size=dp_size):
+                self._check_split_prefill_reuse(SpeculativeAlgorithm.DSPARK, dp_size)
+
+    def _dspark_worker(self, runner, batch, num_tokens):
+        """Exercise the real worker finalizer with CPU target-layer outputs."""
+        worker = object.__new__(DSparkWorkerV2)
+        worker.model_runner = runner
+        runner.prefill_attention_backend_str = "dsv4"
+        worker.device = "cpu"
+        worker.verify_num_draft_tokens = 2
+        worker._target_hidden_projection_enabled = False
+        worker._verify_planner = SimpleNamespace(note_non_decode_step=MagicMock())
+        worker._observers = SimpleNamespace(note_prefill_step=MagicMock())
+        worker._tp_sync = MagicMock()
+        worker._kv_injector = MagicMock()
+        schedule_batch = SimpleNamespace(
+            split_index=0,
+            split_forward_batch=batch,
+            forward_mode=batch.forward_mode,
+            seq_lens=batch.seq_lens.clone(),
+            req_pool_indices=batch.req_pool_indices.clone(),
+            extend_lens=[num_tokens] if num_tokens else [],
+            prefix_lens=[0] if num_tokens else [],
+            out_cache_loc=batch.out_cache_loc.clone(),
+        )
+        target_outputs = []
+
+        def target(current, *, capture_hidden_mode):
+            self.assertIs(capture_hidden_mode, CaptureHiddenMode.FULL)
+            output = runner._forward_raw(
+                current.split_forward_batch, None, split_forward_count=2
+            )
+            output.next_token_ids = torch.zeros(
+                current.seq_lens.numel(), dtype=torch.int64
+            )
+            target_outputs.append(output)
+            return output
+
+        worker._target_worker = SimpleNamespace(
+            model_runner=runner, forward_batch_split_prefill=target
+        )
+        return worker, schedule_batch, target_outputs
+
+    def _check_split_prefill_reuse(self, algorithm, dp_size):
+        """Resuming a prefill must restore its DP geometry without copying inputs.
+
+        Decode overwrites the process-wide DP sizes between slices. Retaining
+        the prepared batch must also preserve the original unpadding bounds,
+        including the fabricated request on an idle MAX_LEN participant.
+        """
+        override = get_context().override_server_args(
+            tp_size=8,
+            attn_dp_size=dp_size,
+            ep_size=1,
+            enable_pdmux=True,
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        old_dp_metadata = (
+            dp_attention.get_global_dp_buffer_len(),
+            dp_attention.get_local_dp_buffer_len(),
+            dp_attention._DpGatheredBufferWrapper._dp_max_padding,
+            dp_attention.get_dp_global_num_tokens(),
+            dp_attention._DpGatheredBufferWrapper._global_num_tokens_gpu,
+        )
+        self.addCleanup(dp_attention.set_dp_buffer_len, *old_dp_metadata)
+        old_extend = get_forward().is_extend_in_batch
+        self.addCleanup(dp_attention.set_is_extend_in_batch, old_extend)
+
+        cases = (
+            (
+                ([9, 5, 6, 4, 3, 2, 1, 7], 2, False),
+                ([9, 0, 6, 4, 0, 0, 0, 0], 2, True),
+                ([9, 0, 6, 4, 0, 0, 0, 0], 1, True),
+                ([9, 0, 6, 4, 0, 0, 0, 0], 1, False),
+                ([9, 0, 0, 0, 0, 0, 0, 0], 0, False),
+                ([9, 0, 0, 0, 0, 0, 0, 0], 7, False),
+            )
+            if dp_size == 8
+            else (
+                ([9, 5], 1, False),
+                ([9, 0], 0, True),
+                ([9, 0], 1, True),
+                ([9, 0], 1, False),
+                ([9, 0], 0, False),
+            )
+        )
+        attn_tp_size = 8 // dp_size
+        for counts, slot, max_len_idle in cases:
+            with (
+                self.subTest(counts=counts, slot=slot, max_len_idle=max_len_idle),
+                get_flags().dp.override(enabled=True, max_len_with_idle=max_len_idle),
+                get_parallel().override(
+                    tp_rank=slot * attn_tp_size, attn_tp_rank=0, attn_dp_rank=slot
+                ),
+                patch("sglang.srt.model_executor.forward_batch_info._is_cpu", True),
+            ):
+                num_tokens = counts[slot]
+                active = num_tokens > 0
+                batch = ForwardBatch(
+                    forward_mode=ForwardMode.SPLIT_PREFILL
+                    if active
+                    else ForwardMode.IDLE,
+                    batch_size=int(active),
+                    input_ids=torch.arange(num_tokens),
+                    req_pool_indices=torch.zeros(int(active), dtype=torch.long),
+                    seq_lens=torch.tensor(
+                        [num_tokens] if active else [], dtype=torch.long
+                    ),
+                    orig_seq_lens=torch.tensor(
+                        [num_tokens] if active else [], dtype=torch.long
+                    ),
+                    out_cache_loc=torch.arange(num_tokens),
+                    seq_lens_sum=num_tokens,
+                    positions=torch.arange(num_tokens),
+                    is_extend_in_batch=True,
+                    global_num_tokens_cpu=list(counts),
+                    global_num_tokens_gpu=torch.tensor(counts),
+                    global_num_tokens_for_logprob_cpu=list(counts),
+                    global_num_token_non_padded=torch.tensor(num_tokens),
+                    global_num_token_non_padded_cpu=num_tokens,
+                )
+                runner = object.__new__(ModelRunner)
+                runner.device = "cpu"
+                runner.is_draft_worker = False
+                runner.spec_algorithm = algorithm
+                runner.lora_manager = None
+                runner.hisparse_coordinator = None
+                runner.req_to_token_pool = None
+                runner.decode_cuda_graph_runner = None
+                runner.device_timer = None
+                runner.pp_group = SimpleNamespace(is_last_rank=True)
+                runner.model_config = SimpleNamespace(
+                    num_hidden_layers=5,
+                    linear_attn_registry_result=None,
+                    is_draft_model=False,
+                    hf_config=SimpleNamespace(
+                        model_type="deepseek_v4",
+                        architectures=None,
+                        get_text_config=lambda: SimpleNamespace(),
+                    ),
+                )
+                runner.attn_backend = _mock_model_runner().attn_backend
+                runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
+                runner.attn_tp_sequence_sharded = lambda rows: False
+                prepared_inputs = {}
+
+                def forward(input_ids, positions, forward_batch, interval):
+                    aligned_counts = [
+                        (n + attn_tp_size - 1) // attn_tp_size * attn_tp_size
+                        for n in counts
+                    ]
+                    expected_counts = (
+                        [max(aligned_counts)] * dp_size
+                        if max_len_idle and 0 in counts
+                        else aligned_counts
+                    )
+                    self.assertEqual(
+                        dp_attention.get_dp_global_num_tokens(), expected_counts
+                    )
+                    self.assertEqual(
+                        dp_attention.get_global_dp_buffer_len(), sum(expected_counts)
+                    )
+                    self.assertEqual(
+                        dp_attention.get_local_dp_buffer_len(), expected_counts[slot]
+                    )
+                    self.assertTrue(get_forward().is_extend_in_batch)
+                    self.assertEqual(
+                        dp_attention.is_dp_max_padding(),
+                        max_len_idle and 0 in counts,
+                    )
+                    self.assertIs(
+                        dp_attention._DpGatheredBufferWrapper._global_num_tokens_gpu,
+                        forward_batch.global_num_tokens_unpadded_gpu,
+                    )
+                    torch.testing.assert_close(
+                        forward_batch.global_num_tokens_unpadded_gpu,
+                        torch.tensor(counts),
+                    )
+                    self.assertEqual(
+                        forward_batch.global_num_token_non_padded_cpu, num_tokens
+                    )
+                    self.assertEqual(
+                        forward_batch.num_token_non_padded.item(), num_tokens
+                    )
+                    for name in ("input_ids", "positions", "seq_lens", "out_cache_loc"):
+                        value = getattr(forward_batch, name)
+                        if name in prepared_inputs:
+                            self.assertIs(value, prepared_inputs[name])
+                        else:
+                            prepared_inputs[name] = value
+                    if forward_batch.hidden_states is None:
+                        forward_batch.hidden_states = input_ids.float().unsqueeze(1)
+                    forward_batch.hidden_states = (
+                        forward_batch.hidden_states + interval[1]
+                    )
+                    if interval[1] == 5:
+                        return SimpleNamespace(
+                            next_token_logits=forward_batch.hidden_states.clone(),
+                            hidden_states=forward_batch.hidden_states.clone(),
+                            hidden_states_token_indices=None,
+                        )
+                    return None
+
+                runner.model = SimpleNamespace(forward_split_prefill=forward)
+                if algorithm.is_dspark():
+                    worker, schedule_batch, target_outputs = self._dspark_worker(
+                        runner, batch, num_tokens
+                    )
+                with (
+                    patch(
+                        "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+                        "pdmux_prefill_handoff",
+                        side_effect=nullcontext,
+                    ) as handoff,
+                    patch(
+                        "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+                        "compute_position",
+                        return_value=(torch.arange(num_tokens), None),
+                    ),
+                    patch(
+                        "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+                        "is_unified_kv_triton",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        runner,
+                        "_prepare_eager_forward_batch",
+                        wraps=runner._prepare_eager_forward_batch,
+                    ) as prepare,
+                    patch.object(
+                        batch,
+                        "post_forward_mlp_sync_batch",
+                        wraps=batch.post_forward_mlp_sync_batch,
+                    ) as unpad,
+                ):
+                    for i in range(3):
+                        # Decode replaces both host sizes and the device-count
+                        # tensor, without changing the retained prefill batch.
+                        dp_attention.set_dp_buffer_len(
+                            8, 1, True, [1] * 8, torch.ones(8)
+                        )
+                        dp_attention.set_is_extend_in_batch(False)
+                        if algorithm.is_dspark():
+                            schedule_batch.split_index = batch.split_index
+                            result = worker.forward_batch_split_prefill(schedule_batch)
+                            raw_logits = target_outputs[-1].logits_output
+                        else:
+                            result = runner._forward_raw(
+                                batch, None, split_forward_count=2
+                            )
+                            raw_logits = result.logits_output
+                        if i < 2:
+                            self.assertIsNone(result.logits_output)
+                            self.assertIs(batch.positions, prepared_inputs["positions"])
+                            unpad.assert_not_called()
+                    prepare.assert_called_once_with(batch)
+                    unpad.assert_called_once_with(raw_logits)
+                    if algorithm.is_dspark():
+                        handoff.assert_called_once_with()
+                        worker._verify_planner.note_non_decode_step.assert_called_once()
+                        worker._observers.note_prefill_step.assert_called_once()
+                        if active:
+                            injected = worker._kv_injector.inject_target_hidden.call_args.kwargs
+                            self.assertEqual(
+                                injected["target_hidden"].shape[0], num_tokens
+                            )
+                            self.assertEqual(injected["cache_loc"].shape[0], num_tokens)
+                            self.assertEqual(injected["positions"].shape[0], num_tokens)
+                            torch.testing.assert_close(
+                                injected["target_hidden"],
+                                (torch.arange(num_tokens).float() + 11).unsqueeze(1),
+                            )
+                            self.assertIsNone(result.logits_output.hidden_states)
+                            self.assertIs(
+                                result.next_draft_input.new_seq_lens,
+                                schedule_batch.seq_lens,
+                            )
+                        else:
+                            worker._kv_injector.inject_target_hidden.assert_not_called()
+                            self.assertIsNone(result.logits_output)
+                self.assertEqual(batch.batch_size, int(active))
+                self.assertEqual(batch.positions.shape[0], num_tokens)
+                self.assertEqual(
+                    batch.forward_mode,
+                    ForwardMode.SPLIT_PREFILL if active else ForwardMode.IDLE,
+                )
+                torch.testing.assert_close(
+                    raw_logits.next_token_logits,
+                    (torch.arange(num_tokens).float() + 11).unsqueeze(1),
+                )
+
+    def test_split_prefill_special_workers_keep_per_slice_preparation(self):
+        self._check_special_worker_preparation(SpeculativeAlgorithm.NONE)
+
+    def test_dspark_special_workers_keep_per_slice_preparation(self):
+        self._check_special_worker_preparation(SpeculativeAlgorithm.DSPARK)
+
+    def _check_special_worker_preparation(self, algorithm):
+        """Speculative and request-specific preparation must not be bypassed."""
+        override = get_context().override_server_args(enable_pdmux=True)
+        override.install()
+        self.addCleanup(override.restore)
+        for guard in (
+            "ordinary",
+            "draft",
+            "spec_algorithm",
+            "spec_info",
+            "lora",
+            "hisparse",
+        ):
+            with self.subTest(guard=guard):
+                runner = object.__new__(ModelRunner)
+                runner.device = "cpu"
+                runner.is_draft_worker = guard == "draft"
+                runner.spec_algorithm = (
+                    SpeculativeAlgorithm.EAGLE
+                    if guard == "spec_algorithm"
+                    else algorithm
+                )
+                runner.lora_manager = object() if guard == "lora" else None
+                runner.hisparse_coordinator = object() if guard == "hisparse" else None
+                runner.decode_cuda_graph_runner = None
+                runner.attn_backend = None
+                runner.pp_group = SimpleNamespace(is_last_rank=True)
+                runner._prepare_eager_forward_batch = MagicMock()
+                runner._maybe_execute_deferred_mamba_cow_and_clear = MagicMock()
+                runner.forward_split_prefill = MagicMock(return_value=None)
+                runner.prefill_cuda_graph_runner = None
+                runner.eager_runner = SimpleNamespace(
+                    execute=MagicMock(return_value=None)
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND
+                    if guard == "ordinary"
+                    else ForwardMode.SPLIT_PREFILL,
+                    global_num_tokens_cpu=[1] * 8,
+                    spec_info=object() if guard == "spec_info" else None,
+                    split_index=2,
+                    post_forward_mlp_sync_batch=MagicMock(),
+                )
+                with patch(
+                    "sglang.srt.model_executor.model_runner.get_global_dwdp_manager",
+                    return_value=None,
+                ):
+                    for _ in range(2):
+                        runner._forward_raw(
+                            batch,
+                            None,
+                            split_forward_count=None if guard == "ordinary" else 2,
+                        )
+                if guard == "ordinary":
+                    self.assertEqual(runner.eager_runner.execute.call_count, 2)
+                    runner.forward_split_prefill.assert_not_called()
+                self.assertEqual(runner._prepare_eager_forward_batch.call_count, 2)
+                self.assertEqual(batch.post_forward_mlp_sync_batch.call_count, 2)
 
 
 if __name__ == "__main__":
