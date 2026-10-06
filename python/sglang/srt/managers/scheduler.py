@@ -290,13 +290,13 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
-from sglang.srt.mem_cache.unified_cache.components.mamba import MambaSlotExhausted
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaSlotExhausted
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl

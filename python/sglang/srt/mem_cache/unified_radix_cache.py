@@ -3465,8 +3465,11 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
-        return (write_back_policy and write_finish_count > 0) or (
-            self.enable_storage and any(storage_queue_sizes)
+        return (
+            (write_back_policy and write_finish_count > 0)
+            # Buffered load completion may free auxiliary device slots.
+            or (self.buffer_pipeline is not None and load_finish_count > 0)
+            or (self.enable_storage and any(storage_queue_sizes))
         )
 
     def flush_pending_backups(self) -> None:

@@ -17,8 +17,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_dp_buffer_len_from_batch,
 )
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -42,7 +43,14 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
 
     def test_publishes_the_padded_list_and_this_ranks_entry(self):
         batch = _batch()
-        with get_parallel().override(attn_dp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            moe_tp_size=2,
+            attn_dp_size=2,
+            attn_tp_size=1,
+            tp_rank=1,
+            attn_dp_rank=1,
+        ):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_global_dp_buffer_len(), 8)
         self.assertEqual(get_local_dp_buffer_len(), 4)
@@ -59,7 +67,14 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
             global_num_tokens_padded_cpu=None,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
         )
-        with get_parallel().override(attn_dp_rank=0):
+        with get_parallel().override(
+            tp_size=2,
+            moe_tp_size=2,
+            attn_dp_size=2,
+            attn_tp_size=1,
+            tp_rank=0,
+            attn_dp_rank=0,
+        ):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 3)
         self.assertFalse(is_dp_max_padding())
@@ -73,7 +88,14 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
             global_num_tokens_gpu=torch.tensor([3]),
             dp_padding_mode=DpPaddingMode.SUM_LEN,
         )
-        with get_parallel().override(attn_dp_rank=1):
+        with get_parallel().override(
+            tp_size=2,
+            moe_tp_size=2,
+            attn_dp_size=2,
+            attn_tp_size=1,
+            tp_rank=1,
+            attn_dp_rank=1,
+        ):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 3)
 
@@ -83,14 +105,49 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
             global_num_tokens_gpu=torch.tensor([4, 4]),
             global_num_tokens_unpadded_gpu=real_counts,
         )
-        with get_parallel().override(attn_dp_rank=0):
+        with get_parallel().override(
+            tp_size=2,
+            moe_tp_size=2,
+            attn_dp_size=2,
+            attn_tp_size=1,
+            tp_rank=0,
+            attn_dp_rank=0,
+        ):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_dp_global_num_tokens(), [4, 4])
         self.assertIs(
             _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu(), real_counts
         )
 
+    def test_draft_scope_uses_target_gather_slot(self):
+        batch = _batch(
+            global_dp_buffer_len=12,
+            global_num_tokens_padded_cpu=[4, 8],
+        )
+        with (
+            get_flags().dp.override(scoped_gather_slot=1),
+            patch.object(dp_attention, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attention,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    attn_dp_enabled=True,
+                    num_dp_ranks=2,
+                    attn_dp_rank=0,
+                    attn_dp_size=1,
+                ),
+            ),
+        ):
+            set_dp_buffer_len_from_batch(batch)
+        self.assertEqual(get_local_dp_buffer_len(), 8)
+        self.assertEqual(get_dp_global_num_tokens(), [4, 8])
+
     def test_real_counts_survive_multiple_prefill_slices(self):
+        config = get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[]))
+        )
+        config.install()
+        self.addCleanup(config.restore)
         real_counts = torch.tensor([3, 0])
         batch = SimpleNamespace(
             global_num_tokens_cpu=[3, 0],
@@ -111,7 +168,14 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
         )
         prefix = "sglang.srt.model_executor.forward_batch_info"
         with (
-            get_parallel().override(attn_dp_rank=0, attn_tp_size=2),
+            get_parallel().override(
+                tp_size=4,
+                moe_tp_size=4,
+                attn_dp_size=2,
+                attn_tp_size=2,
+                tp_rank=0,
+                attn_dp_rank=0,
+            ),
             patch(f"{prefix}._is_cpu", True),
             patch(f"{prefix}._mega_moe_materializes_idle_rank", return_value=False),
             patch(
@@ -165,7 +229,12 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
                 ),
                 patch.object(_DpGatheredBufferWrapper, "set_metadata"),
             ):
-                dp_attention.init_dp_gathered_buffer(config)
+                with patch.object(
+                    dp_attention,
+                    "get_device",
+                    return_value=SimpleNamespace(device="cpu"),
+                ):
+                    dp_attention.init_dp_gathered_buffer(config)
                 self.assertEqual(
                     get_flags().dp.max_len_with_idle, not (enabled and is_glm)
                 )

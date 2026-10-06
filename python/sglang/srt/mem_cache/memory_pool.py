@@ -1455,9 +1455,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def mamba_slots_needed_for_extend(
         self, req: Req, *, reserve_cache_slot: bool = False
     ) -> int:
-        needed = int(
-            not req.kv.holds_mamba and req.kv.mamba_prefill_live_slot is None
-        )
+        needed = int(not req.kv.holds_mamba and req.kv.mamba_prefill_live_slot is None)
         if (
             self.enable_mamba_extra_buffer
             and req.kv.mamba_ping_pong_track_buffer is None
@@ -1493,9 +1491,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 if self.enable_mamba_extra_buffer_lazy
                 else self.mamba_ping_pong_track_buffer_size
             )
-        need_checkpoint = reserve_cache_slot and self.needs_mamba_cache_reservation(
-            req
-        )
+        need_checkpoint = reserve_cache_slot and self.needs_mamba_cache_reservation(req)
         slots = []
         for _ in range(int(need_live) + ping_pong_count + int(need_checkpoint)):
             slot = self.mamba_allocator.alloc(1)

@@ -881,8 +881,7 @@ class PrefillAdder:
         if not isinstance(pool, HybridReqToTokenPool):
             return True
         needed = self._mamba_slots_needed_for_req(req) + sum(
-            self._mamba_slots_needed_for_req(admitted)
-            for admitted in self.can_run_list
+            self._mamba_slots_needed_for_req(admitted) for admitted in self.can_run_list
         )
         allocator = pool.mamba_allocator
         available = allocator.admission_available_size()
@@ -1056,9 +1055,7 @@ class PrefillAdder:
 
         return trunc_len
 
-    def _add_dllm_req(
-        self, req: Req, prefix_len: int, mamba_gap_reserve: int
-    ):
+    def _add_dllm_req(self, req: Req, prefix_len: int, mamba_gap_reserve: int):
         trunc_len = self._get_dllm_extend_len(req, prefix_len)
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
 

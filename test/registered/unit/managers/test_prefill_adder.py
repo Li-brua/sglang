@@ -155,10 +155,11 @@ class TestPrefillAdder(CustomTestCase):
     def test_mamba_admission_counts_ping_pong_and_pending_batch_slots(self):
         pool = object.__new__(HybridReqToTokenPool)
         pool.enable_mamba_extra_buffer = True
+        pool.mamba_ckpt_pool = None
         pool.enable_mamba_extra_buffer_lazy = False
         pool.mamba_ping_pong_track_buffer_size = 1
         pool.mamba_allocator = MagicMock()
-        pool.mamba_allocator.admission_available_size.return_value = 2
+        pool.mamba_allocator.admission_available_size.return_value = 3
         cache = SimpleNamespace(
             req_to_token_pool=pool,
             supports_mamba=lambda: True,
@@ -169,35 +170,45 @@ class TestPrefillAdder(CustomTestCase):
         adder.can_run_list = []
         adder._mamba_slot_cost = 4
         fresh = SimpleNamespace(
+            skip_radix_cache_insert=False,
             kv=SimpleNamespace(
-                holds_mamba=False, mamba_ping_pong_track_buffer=None
-            )
+                holds_mamba=False,
+                mamba_ping_pong_track_buffer=None,
+                mamba_prefill_live_slot=None,
+                mamba_prefill_ping_pong_slots=None,
+                mamba_cache_reserve_slot=None,
+            ),
         )
         matched = SimpleNamespace(
+            skip_radix_cache_insert=False,
             kv=SimpleNamespace(
-                holds_mamba=True, mamba_ping_pong_track_buffer=None
-            )
+                holds_mamba=True,
+                mamba_ping_pong_track_buffer=None,
+                mamba_prefill_live_slot=None,
+                mamba_prefill_ping_pong_slots=None,
+                mamba_cache_reserve_slot=None,
+            ),
         )
 
-        self.assertEqual(adder._mamba_slots_needed_for_req(fresh), 2)
-        self.assertEqual(adder._mamba_slots_needed_for_req(matched), 1)
-        self.assertEqual(adder._mamba_gap_budget_for_req(fresh), 8)
+        self.assertEqual(adder._mamba_slots_needed_for_req(fresh), 3)
+        self.assertEqual(adder._mamba_slots_needed_for_req(matched), 2)
+        self.assertEqual(adder._mamba_gap_budget_for_req(fresh), 12)
         self.assertTrue(adder._has_mamba_slots_for_req(fresh))
 
         adder.can_run_list.append(fresh)
         self.assertFalse(adder._has_mamba_slots_for_req(matched))
         cache.evict_for_alloc.assert_called_once_with(
-            EvictParams(num_tokens=0, mamba_num=1)
+            EvictParams(num_tokens=0, mamba_num=2)
         )
 
         # Prefix COW or HiCache load-back may already own the live state;
-        # only the missing tracking buffer is then charged at admission.
-        pool.mamba_allocator.admission_available_size.return_value = 1
+        # the tracking buffer and checkpoint slot are charged at admission.
+        pool.mamba_allocator.admission_available_size.return_value = 2
         adder.can_run_list.clear()
         self.assertTrue(adder._has_mamba_slots_for_req(matched))
 
         pool.mamba_ping_pong_track_buffer_size = 2
-        self.assertEqual(adder._mamba_slots_needed_for_req(fresh), 3)
+        self.assertEqual(adder._mamba_slots_needed_for_req(fresh), 4)
 
         adder.page_size = 1
         adder.per_req_token_overhead = 1

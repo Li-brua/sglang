@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
@@ -97,9 +97,7 @@ class TestMambaPrefillReservation(unittest.TestCase):
         self.assertEqual(
             pool.mamba_slots_needed_for_extend(req, reserve_cache_slot=True), 2
         )
-        self.assertTrue(
-            pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True)
-        )
+        self.assertTrue(pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True))
         with patch.object(ReqToTokenPool, "alloc", return_value=[0]):
             with patch.object(
                 pool.mamba_allocator,
@@ -136,9 +134,7 @@ class TestMambaPrefillReservation(unittest.TestCase):
 
     def test_aborted_prefill_releases_unconsumed_reservation(self):
         pool, req = _make_pool_and_req()
-        self.assertTrue(
-            pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True)
-        )
+        self.assertTrue(pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True))
         with patch.object(ReqToTokenPool, "alloc", return_value=[0]):
             pool.alloc([req], reserve_mamba_cache_slot=True)
         self.assertEqual(pool.mamba_allocator.available_size(), 0)
@@ -148,14 +144,15 @@ class TestMambaPrefillReservation(unittest.TestCase):
 
     def test_uncacheable_prefill_releases_unconsumed_reservation(self):
         pool, req = _make_pool_and_req()
-        self.assertTrue(
-            pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True)
-        )
+        self.assertTrue(pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True))
         with patch.object(ReqToTokenPool, "alloc", return_value=[0]):
             pool.alloc([req], reserve_mamba_cache_slot=True)
         req.skip_radix_cache_insert = True
+        req.finished = lambda: False
+        req.extend_range = SimpleNamespace(end=16)
+        pool.req_to_token = torch.arange(16).reshape(1, 16)
         cache = SimpleNamespace(req_to_token_pool=pool)
-        maybe_cache_unfinished_req(req, cache)
+        checkpoint_kv_cache(req, cache)
         self.assertIsNone(req.kv.mamba_cache_reserve_slot)
         self.assertEqual(pool.mamba_allocator.available_size(), 1)
         pool.free_mamba_cache(req)
@@ -164,9 +161,7 @@ class TestMambaPrefillReservation(unittest.TestCase):
     def test_partial_admission_reservation_rolls_back(self):
         pool, req = _make_pool_and_req()
         pool.mamba_allocator.alloc(1)  # Leave room for only one of two slots.
-        self.assertFalse(
-            pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True)
-        )
+        self.assertFalse(pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True))
         self.assertEqual(pool.mamba_allocator.available_size(), 1)
         self.assertIsNone(req.kv.mamba_prefill_ping_pong_slots)
         self.assertIsNone(req.kv.mamba_cache_reserve_slot)
@@ -179,9 +174,7 @@ class TestMambaPrefillReservation(unittest.TestCase):
         self.assertEqual(
             pool.mamba_slots_needed_for_extend(req, reserve_cache_slot=True), 3
         )
-        self.assertTrue(
-            pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True)
-        )
+        self.assertTrue(pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True))
         self.assertEqual(pool.mamba_allocator.available_size(), 0)
         with patch.object(ReqToTokenPool, "alloc", return_value=[0]):
             with patch.object(
@@ -200,9 +193,7 @@ class TestMambaPrefillReservation(unittest.TestCase):
         pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
         req.kv.mamba_pool_idx = None
         req.kv.holds_mamba = False
-        self.assertTrue(
-            pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True)
-        )
+        self.assertTrue(pool.reserve_mamba_prefill_slots(req, reserve_cache_slot=True))
         component = object.__new__(MambaComponent)
         component.cache = SimpleNamespace(req_to_token_pool=pool)
         component.tree_core = SimpleNamespace(

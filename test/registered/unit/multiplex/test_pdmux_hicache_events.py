@@ -105,13 +105,17 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.HICACHE_PUMP_INTERVAL = pump_interval
 
         self.model_config = SimpleNamespace(num_hidden_layers=NUM_LAYERS)
-        self.pdmux_config = SimpleNamespace(split_forward_token_budget=1000)
+        self.pdmux_config = SimpleNamespace(
+            split_forward_token_budget=1000, max_split_forward_layers=0
+        )
         self.ps = SimpleNamespace(tp_size=1)
         self.tp_cpu_group = SimpleNamespace(
             allreduce=lambda tensor, op: SimpleNamespace(wait=lambda: None)
         )
         self.tree_cache = Mock()
-        self.dp_attn_adapter = SimpleNamespace(maybe_prepare_mlp_sync_batch=lambda batch: batch)
+        self.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
         self.chunked_req = None
         self.split_prefill_batch = None
         self.running_batch = _DecodeBatch()

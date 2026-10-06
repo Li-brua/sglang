@@ -390,8 +390,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
         self.assertEqual(
             cudart.registrations,
-            [(base, 4 * gib, 0)]
-            + [(base + i * gib, gib, 0) for i in range(4)],
+            [(base, 4 * gib, 0)] + [(base + i * gib, gib, 0) for i in range(4)],
         )
         self.assertEqual(
             cudart.unregistrations,

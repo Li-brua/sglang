@@ -1481,9 +1481,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         prefill_stream, decode_stream = get_stream_groups()[get_current_stream_idx()]
         prefill_stream.wait_stream(decode_stream)
-        return self._finish_prefill_batch(
-            draft_batch, batch_output
-        )
+        return self._finish_prefill_batch(draft_batch, batch_output)
 
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None

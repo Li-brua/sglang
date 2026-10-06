@@ -428,6 +428,7 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and not has_decode
                 )
                 if not has_decode and self.split_prefill_batch is None:
+                    self._sched_idled = True
                     self.on_idle()
 
             if adjust_stream_group:

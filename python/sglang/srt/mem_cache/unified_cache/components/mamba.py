@@ -513,14 +513,14 @@ class MambaComponent(TreeComponent):
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
-            evicted = self.cache.evict_for_alloc(
-                EvictParams(num_tokens=0, mamba_num=1)
-            )
+            evicted = self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             if slot is None:
                 pool = self.cache.req_to_token_pool
                 ct = self.component_type
-                pool_size = getattr(getattr(pool, "mamba_pool", None), "size", "unknown")
+                pool_size = getattr(
+                    getattr(pool, "mamba_pool", None), "size", "unknown"
+                )
                 raise AssertionError(
                     "Can not alloc mamba cache: "
                     f"pool_size={pool_size}, "

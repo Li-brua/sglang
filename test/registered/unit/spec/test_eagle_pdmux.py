@@ -41,7 +41,6 @@ class TestEaglePDMux(unittest.TestCase):
         worker._draft_worker = SimpleNamespace(
             draft_runner=SimpleNamespace(tp_group=object()),
             draft_owns_attention=False,
-            draft_tp_context=Mock(return_value=nullcontext()),
         )
         ids = torch.empty(0, dtype=torch.long) if idle else torch.tensor([1, 2, 3, 4])
         batch = SimpleNamespace(
@@ -123,6 +122,10 @@ class TestEaglePDMux(unittest.TestCase):
                 "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
                 return_value=nullcontext(),
             ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.draft_tp_context",
+                return_value=nullcontext(),
+            ) as draft_context,
         ):
             for index in range(3):
                 batch.split_index = index
@@ -144,9 +147,7 @@ class TestEaglePDMux(unittest.TestCase):
             batch.forward_mode, ForwardMode.IDLE if idle else ForwardMode.SPLIT_PREFILL
         )
         worker._draft_worker._draft_extend_for_prefill.assert_called_once()
-        worker._draft_worker.draft_tp_context.assert_called_once_with(
-            prefill_group, owns_attention=False
-        )
+        draft_context.assert_called_once_with(False)
         prefill_stream.wait_stream.assert_called_once_with(decode_stream)
         self.assertEqual(worker._target_worker.set_hicache_consumer.call_count, 3)
 
@@ -177,7 +178,6 @@ class TestEaglePDMux(unittest.TestCase):
             is_draft_worker=draft,
             attn_backend=prefill,
             decode_attn_backend=decode,
-            attn_dcp_size=1,
             device="cpu",
             device_timer=None,
             prefill_cuda_graph_runner=None,
@@ -199,6 +199,10 @@ class TestEaglePDMux(unittest.TestCase):
     def test_eager_verify_preserves_prefill_metadata(self):
         runner, batch, prefill, decode = self.make_eager()
         with (
+            patch(
+                "sglang.srt.model_executor.runner.eager_runner.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1),
+            ),
             patch(
                 "sglang.srt.model_executor.runner.eager_runner.is_cp_active",
                 return_value=False,

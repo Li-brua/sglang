@@ -8,6 +8,9 @@ from unittest.mock import Mock, patch
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary import PLAIN_ADD
+from sglang.srt.layers.layer_boundary.output import UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.glm5_next import (
@@ -25,25 +28,31 @@ class FakeLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.seen_topk = []
-        self.layer_communicator = SimpleNamespace(
-            finish_layer_stack=lambda hidden, residual, batch: (hidden, residual)
-        )
+        self.group = SimpleNamespace(all_reduce=lambda value: value * 2)
 
     def forward(
         self,
         positions,
         hidden_states,
         forward_batch,
-        residual,
         zero_allocator,
         gemm_output_zero_allocator,
         prev_topk_indices=None,
+        capture_output=None,
     ):
         self.seen_topk.append(prev_topk_indices)
         prev = 0 if prev_topk_indices is None else prev_topk_indices.item()
-        hidden_states = hidden_states + self.layer_id + prev + 1
-        residual = torch.ones_like(hidden_states) if residual is None else residual + 1
-        return hidden_states, residual, torch.tensor([self.layer_id + 1])
+        stream = residual_batch.stream_of(forward_batch)
+        hidden_states, residual = stream.export(hidden_states)
+        written = hidden_states if residual is None else hidden_states + residual
+        stream.write(written)
+        if capture_output is not None:
+            capture_output(written)
+        output = torch.full_like(written, self.layer_id + prev + 1)
+        hidden_states = stream.record(
+            UnreducedOutput(output, group=self.group), PLAIN_ADD
+        )
+        return hidden_states, torch.tensor([self.layer_id + 1])
 
 
 class FakeNorm(nn.Module):
@@ -76,7 +85,7 @@ def make_batch():
         forward_mode=ForwardMode.SPLIT_PREFILL,
         can_run_tbo=False,
         hidden_states=None,
-        residual=None,
+        residual_stream=None,
         model_specific_states=None,
     )
 
@@ -198,13 +207,17 @@ class TestGlm5NextPDMux(unittest.TestCase):
                     split_interval=(0, 1),
                 )
             )
+            stream = batch.residual_stream
+            self.assertIsNotNone(stream.pending)
             self.assertIsNone(
                 model.forward_split_prefill(input_ids, positions, batch, (1, 2))
             )
+            self.assertIs(batch.residual_stream, stream)
             actual, actual_aux = model.forward_split_prefill(
                 input_ids, positions, batch, (2, 3)
             )
 
+        self.assertIsNone(batch.residual_stream)
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_aux[0], expected_aux[0])
         self.assertEqual(len(actual_aux), 1)
