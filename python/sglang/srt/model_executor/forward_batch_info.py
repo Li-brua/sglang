@@ -295,6 +295,9 @@ class ForwardMode(IntEnum):
     def is_cpu_graph(self):
         return self == ForwardMode.DECODE
 
+    def is_dllm_extend(self):
+        return self == ForwardMode.DLLM_EXTEND
+
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
 
@@ -663,9 +666,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Real counts stay invariant across layer slices; gather counts are writable.
-    global_num_tokens_unpadded_cpu: Optional[List[int]] = None
-    global_num_tokens_unpadded_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -1630,12 +1630,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_for_logprob_cpu is not None
 
         self._original_batch_size = self.batch_size
-        if self.global_num_tokens_unpadded_cpu is None:
-            self.global_num_tokens_unpadded_cpu = list(self.global_num_tokens_cpu)
-            self.global_num_tokens_unpadded_gpu = self.global_num_tokens_gpu
-        if self.global_num_tokens_gpu is self.global_num_tokens_unpadded_gpu:
-            self.global_num_tokens_gpu = torch.empty_like(self.global_num_tokens_gpu)
-        global_num_tokens = list(self.global_num_tokens_unpadded_cpu)
+        global_num_tokens = list(self.global_num_tokens_cpu)
         # MegaMoEv2 dispatch is rank-synchronous, so an idle rank still carries the
         # one row _run_mega_routed fabricates for it. HIP-only, False elsewhere.
         mega_moe_idle_materialize = _mega_moe_materializes_idle_rank(self)

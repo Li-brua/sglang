@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -79,79 +79,61 @@ class TestDSparkPDMux(unittest.TestCase):
                 target_worker=target_worker,
             )
 
-    def make_worker(self, idle=False):
-        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
-        worker.model_runner = SimpleNamespace(
-            model_config=SimpleNamespace(num_hidden_layers=2)
+    def test_split_prefill_finalizes_only_after_last_segment(self):
+        intermediate = SimpleNamespace(logits_output=None)
+        final = SimpleNamespace(logits_output=object())
+        target_worker = SimpleNamespace(
+            forward_batch_split_prefill=Mock(side_effect=[intermediate, final])
         )
+        worker = object.__new__(DSparkWorkerV2)
+        worker._target_worker = target_worker
         worker._verify_planner = SimpleNamespace(note_non_decode_step=Mock())
         worker._observers = SimpleNamespace(note_prefill_step=Mock())
-        worker._finalize_prefill = Mock(return_value="injected")
-        worker._decode_idle_result = Mock(return_value="idle")
+        worker._finalize_prefill = Mock(return_value="finalized")
         batch = SimpleNamespace(
             split_index=0,
-            split_forward_batch=SimpleNamespace(split_index=0),
-            forward_mode=ForwardMode.IDLE if idle else ForwardMode.SPLIT_PREFILL,
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        intermediate = SimpleNamespace(logits_output=None)
-        # Real final IDLE may have no logits. Completion is a layer boundary.
-        final = SimpleNamespace(logits_output=None if idle else object())
 
-        def target(current, **kwargs):
-            current.split_forward_batch.split_index += 1
-            return (
-                intermediate if current.split_forward_batch.split_index == 1 else final
-            )
+        first = worker.forward_batch_split_prefill(batch)
+        batch.split_index = 1
+        second = worker.forward_batch_split_prefill(batch)
 
-        worker._target_worker = SimpleNamespace(
-            forward_batch_split_prefill=Mock(side_effect=target)
-        )
-        return worker, batch, intermediate, final
-
-    def run_split(self, idle=False):
-        worker, batch, intermediate, final = self.make_worker(idle)
-        prefill, decode = Mock(), Mock()
-        with (
-            patch(
-                "sglang.srt.multiplex.pdmux_context.get_current_stream_idx",
-                return_value=0,
-            ),
-            patch(
-                "sglang.srt.multiplex.pdmux_context.get_stream_groups",
-                return_value=[(prefill, decode)],
-            ),
-        ):
-            self.assertIs(worker.forward_batch_split_prefill(batch), intermediate)
-            worker._finalize_prefill.assert_not_called()
-            prefill.wait_stream.assert_not_called()
-            decode.wait_event.assert_not_called()
-            batch.split_index = 1
-            self.assertEqual(
-                worker.forward_batch_split_prefill(batch),
-                "idle" if idle else "injected",
-            )
+        self.assertIs(first, intermediate)
+        self.assertEqual(second, "finalized")
         worker._verify_planner.note_non_decode_step.assert_called_once_with()
         worker._observers.note_prefill_step.assert_called_once_with()
-        prefill.wait_stream.assert_called_once_with(decode)
-        prefill.record_event.assert_called_once_with()
-        decode.wait_event.assert_called_once_with(prefill.record_event.return_value)
         self.assertEqual(
-            worker.target_worker.forward_batch_split_prefill.call_args.kwargs,
+            target_worker.forward_batch_split_prefill.call_args_list[0].kwargs,
             {"capture_hidden_mode": CaptureHiddenMode.FULL},
         )
-        if idle:
-            worker._decode_idle_result.assert_called_once_with(on_publish=None)
-            worker._finalize_prefill.assert_not_called()
-        else:
-            worker._finalize_prefill.assert_called_once_with(
-                batch, final, on_publish=None
-            )
+        worker._finalize_prefill.assert_called_once_with(batch, final, on_publish=None)
 
-    def test_final_slice_injects_and_fences_next_decode(self):
-        self.run_split()
+    def test_split_prefill_idle_rank_skips_finalization(self):
+        intermediate = SimpleNamespace(logits_output=None)
+        final = SimpleNamespace(logits_output=object())
+        target_worker = SimpleNamespace(
+            forward_batch_split_prefill=Mock(side_effect=[intermediate, final])
+        )
+        worker = object.__new__(DSparkWorkerV2)
+        worker._target_worker = target_worker
+        worker._verify_planner = SimpleNamespace(note_non_decode_step=Mock())
+        worker._observers = SimpleNamespace(note_prefill_step=Mock())
+        worker._decode_idle_result = Mock(return_value="idle")
+        worker._finalize_prefill = Mock()
+        batch = SimpleNamespace(
+            split_index=0,
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+        )
 
-    def test_final_idle_without_logits_skips_injection(self):
-        self.run_split(idle=True)
+        first = worker.forward_batch_split_prefill(batch)
+        batch.split_index = 1
+        second = worker.forward_batch_split_prefill(batch)
+
+        self.assertIs(first, intermediate)
+        self.assertEqual(second, "idle")
+        worker._decode_idle_result.assert_called_once_with(on_publish=None)
+        worker._finalize_prefill.assert_not_called()
 
     def test_stream_switch_updates_target_and_draft_runners(self):
         worker = object.__new__(DSparkWorkerV2)

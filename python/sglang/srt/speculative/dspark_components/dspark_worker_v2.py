@@ -81,7 +81,6 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
-    pdmux_prefill_handoff,
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
@@ -680,15 +679,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output = self.target_worker.forward_batch_split_prefill(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
-        if (
-            batch.split_forward_batch.split_index
-            < self.model_runner.model_config.num_hidden_layers
-        ):
+        if batch_output.logits_output is None:
             return batch_output
-        with pdmux_prefill_handoff():
-            if batch.forward_mode.is_idle():
-                return self._decode_idle_result(on_publish=None)
-            return self._finalize_prefill(batch, batch_output, on_publish=None)
+        if batch.forward_mode.is_idle():
+            return self._decode_idle_result(on_publish=None)
+        return self._finalize_prefill(batch, batch_output, on_publish=None)
 
     def _finalize_prefill(
         self,

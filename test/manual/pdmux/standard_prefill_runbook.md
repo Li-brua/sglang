@@ -7,10 +7,6 @@ Status wording to use in the report: *the main design questions have a static
 explanation; correctness, resource attribution, TP8 concurrency and
 performance are still to be validated.*
 
-For the layer-split attention-DP preparation optimization (including DSPARK),
-see [dp_prefill_reuse.md](dp_prefill_reuse.md). The standard lane still executes
-each token chunk in one call.
-
 ## 0. Checkpoint check (run first; DSpark depends on the answer)
 
 ```bash
