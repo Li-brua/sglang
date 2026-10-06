@@ -1230,7 +1230,9 @@ class PrefillAdder:
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
         )
-        if self._prefill_token_budget_exceeded(paged_input):
+        if self._prefill_token_budget_exceeded(
+            self.ceil_paged_tokens(cand_extend_input_len)
+        ):
             return AddReqResult.OTHER
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
@@ -1559,9 +1561,8 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Standard PDMux enforces the cap even for the first request.
-        if (
-            self.rem_chunk_tokens is None
-            and self._prefill_token_budget_exceeded(input_tokens)
+        if self.rem_chunk_tokens is None and self._prefill_token_budget_exceeded(
+            input_tokens
         ):
             return AddReqResult.OTHER
 

@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.distributed.parallel_state import is_pdmux_enabled
 from sglang.srt.utils import is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
@@ -282,7 +283,7 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
-        enable_cluster,
+        enable_cluster and not is_pdmux_enabled(),
     )
 
 

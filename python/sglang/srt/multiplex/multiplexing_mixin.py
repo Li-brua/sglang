@@ -14,8 +14,8 @@ import torch.distributed as dist
 from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import pdmux_prefill_tp_group
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
     get_sm_counts,
@@ -127,9 +127,7 @@ class SchedulerMultiplexMixin:
         """Yield an incomplete token-chunk request at a safe chunk boundary."""
         if (
             not chunk_stashed
-            or not SchedulerMultiplexMixin._pdmux_layer_chunk_round_robin_enabled(
-                self
-            )
+            or not SchedulerMultiplexMixin._pdmux_layer_chunk_round_robin_enabled(self)
             or not getattr(self, "waiting_queue", None)
             or getattr(req, "finished", lambda: False)()
         ):
@@ -289,9 +287,7 @@ class SchedulerMultiplexMixin:
         # active and IDLE prefill batches. Size segments from its maximum so an
         # IDLE rank (whose local extend_num_tokens is zero) advances by exactly
         # the same layer count as the busiest active rank.
-        global_num_tokens = (
-            self.split_prefill_batch.scheduler_global_num_tokens
-        )
+        global_num_tokens = self.split_prefill_batch.scheduler_global_num_tokens
         prefill_num_tokens = (
             max(global_num_tokens, default=0)
             if global_num_tokens is not None
@@ -302,8 +298,7 @@ class SchedulerMultiplexMixin:
 
         forward_count = max(
             1,
-            self.pdmux_config.split_forward_token_budget
-            // prefill_num_tokens,
+            self.pdmux_config.split_forward_token_budget // prefill_num_tokens,
         )
         return min(forward_count, remaining_layers)
 
@@ -571,7 +566,6 @@ class SchedulerMultiplexMixin:
                         formation_done = prefill_stream.record_event()
 
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
                 if formation_done is not None:
                     decode_stream.wait_event(formation_done)
                 running_batch = self.update_running_batch(running_batch)
@@ -842,9 +836,7 @@ class SchedulerMultiplexMixin:
 
         while True:
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
-                recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
+                self.ingest_requests()
                 running_batch = self.running_batch
                 # E0: prefetch's prefix matching concatenates on this stream.
                 input_done = decode_stream.record_event()
@@ -852,8 +844,7 @@ class SchedulerMultiplexMixin:
             inflight = self._pdmux_prefill_inflight
 
             formation_done = None
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
+            with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 if inflight is None:
                     prefill_stream.wait_event(input_done)
                     if decode_done is not None:
@@ -878,7 +869,6 @@ class SchedulerMultiplexMixin:
                     formation_done = prefill_stream.record_event()
 
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
                 if formation_done is not None:
                     decode_stream.wait_event(formation_done)
                 if inflight is not None:
@@ -889,6 +879,7 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and running_batch.is_empty()
                 )
                 if running_batch.is_empty() and not self._extra_inflight_batches():
+                    self._sched_idled = True
                     self.on_idle()
 
             # Never switch with a forward in flight: the switch drains both
@@ -912,7 +903,6 @@ class SchedulerMultiplexMixin:
 
             decode_result = None
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
                 decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
                     running_batch
                     if running_batch is not None and not running_batch.is_empty()
@@ -921,14 +911,12 @@ class SchedulerMultiplexMixin:
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
 
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
+            with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 if self._pdmux_prefill_pending is not None:
                     self._submit_standard_prefill(self._pdmux_prefill_pending)
                     self._pdmux_prefill_pending = None
 
             with torch.cuda.stream(decode_stream):
-                set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_result is not None:
                     self.process_batch_result(decode_batch, decode_result)
@@ -936,8 +924,7 @@ class SchedulerMultiplexMixin:
                 # retract/free inside update_running_batch, and the pump above.
                 decode_done = decode_stream.record_event()
 
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
+            with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 if self._pdmux_prefill_inflight is not None:
                     running_batch, merged = self._advance_standard_prefill(
                         running_batch=running_batch,

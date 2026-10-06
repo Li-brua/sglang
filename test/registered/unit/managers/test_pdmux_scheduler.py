@@ -1,6 +1,6 @@
 import ast
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -9,9 +9,10 @@ import sglang.srt.distributed.parallel_state as parallel_state
 from sglang.srt.distributed.parallel_state import (
     is_pdmux_enabled,
     is_pdmux_prefill_enabled,
-    set_pdmux_status,
+    pdmux_prefill_tp_group,
 )
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -61,6 +62,10 @@ def _init_call_order(class_name, targets):
     return positions
 
 
+class _Scheduler(SimpleNamespace, SchedulerMultiplexMixin):
+    pass
+
+
 class _Batch:
     def __init__(self, empty):
         self._empty = empty
@@ -88,38 +93,22 @@ def _make_chunked_req(*, extend_end, prefix_len):
 
 class TestPDMuxScheduler(unittest.TestCase):
     def test_dp_attn_adapter_uses_active_pdmux_tp_group(self):
+        # The current raw preparer reads the runtime group inside the lane scope.
         tree = ast.parse(DP_ATTN_PATH.read_text(encoding="utf-8"))
-        cls = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "SchedulerDPAttnAdapter"
-        )
         method = next(
             node
-            for node in cls.body
+            for node in tree.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "prepare_mlp_sync_batch"
+            and node.name == "prepare_mlp_sync_batch_raw"
         )
-        prepare_call = next(
+        reads = [
             node
             for node in ast.walk(method)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "prepare_mlp_sync_batch_raw"
-        )
-        tp_group = next(
-            keyword.value
-            for keyword in prepare_call.keywords
-            if keyword.arg == "tp_group"
-        )
-
-        self.assertIsInstance(tp_group, ast.Call)
-        self.assertIsInstance(tp_group.func, ast.Name)
-        self.assertEqual(tp_group.func.id, "get_tp_group")
-
-    def tearDown(self):
-        set_pdmux_status(False)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "parallel"
+        ]
+        self.assertIn("tp_group", [node.attr for node in reads])
 
     def _make_scheduler(
         self,
@@ -130,7 +119,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler_global_num_tokens=None,
         token_budget=65536,
     ):
-        return SimpleNamespace(
+        return _Scheduler(
             model_config=SimpleNamespace(num_hidden_layers=61),
             pdmux_config=SimpleNamespace(split_forward_token_budget=token_budget),
             running_batch=_Batch(decode_empty),
@@ -215,7 +204,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertEqual(count, 54)
 
     def test_dsv4_prefill_admission_uses_planner_hard_limit(self):
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             pdmux_max_prefill_plan_tokens=(1 << 16) - 1,
             page_size=16,
@@ -230,7 +219,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertTrue(enforce)
 
     def test_non_dsv4_prefill_admission_preserves_soft_budget(self):
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             pdmux_max_prefill_plan_tokens=None,
             page_size=16,
@@ -248,7 +237,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         """Chunked prefill enforces the planner limit per chunk, so the hard
         admission clamp must deactivate — keeping it would re-reject the long
         requests chunking exists to serve."""
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             pdmux_max_prefill_plan_tokens=(1 << 16) - 1,
             page_size=16,
@@ -263,7 +252,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertFalse(enforce)
 
     def test_dsv4_request_length_stays_within_planner_limit(self):
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             pdmux_max_prefill_plan_tokens=(1 << 16) - 1,
             max_prefill_tokens=131072,
@@ -278,7 +267,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertEqual(max_input_len, 65521)
 
     def test_dsv4_request_limit_matches_smaller_prefill_budget(self):
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             pdmux_max_prefill_plan_tokens=(1 << 16) - 1,
             max_prefill_tokens=32767,
@@ -300,7 +289,7 @@ class TestPDMuxScheduler(unittest.TestCase):
     def test_init_rejects_chunked_prefill_size_over_plan_limit(self):
         """65520 is the page-aligned uint16 compressor-plan cap; a larger
         chunk budget would overflow a single prefill plan at runtime."""
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             page_size=16,
             chunked_prefill_size=65536,
@@ -317,7 +306,7 @@ class TestPDMuxScheduler(unittest.TestCase):
     def test_init_accepts_chunked_prefill_size_at_plan_limit(self):
         """With a valid chunk budget the per-request length clamp must stay
         off: chunking is what serves requests beyond the planner limit."""
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             page_size=16,
             chunked_prefill_size=65520,
@@ -336,7 +325,7 @@ class TestPDMuxScheduler(unittest.TestCase):
     def test_init_tightens_request_length_without_chunked_prefill(self):
         """Without chunking PDMux cannot split an oversized request, so init
         must clamp request validation to the planner limit."""
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             enable_pdmux=True,
             page_size=16,
             chunked_prefill_size=None,
@@ -373,8 +362,8 @@ class TestPDMuxScheduler(unittest.TestCase):
             yield
 
     def _make_stream_group_scheduler(self, *, manual_divisions, group_num):
-        model_runner = SimpleNamespace(update_decode_attn_backend=lambda _idx: None)
-        return SimpleNamespace(
+        model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
+        return _Scheduler(
             split_prefill_batch=object(),
             pdmux_standard=False,
             draft_worker=None,
@@ -491,8 +480,8 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
 
     def test_pdmux_initialization_uses_parallel_state_gpu_id(self):
-        config = object()
-        scheduler = SimpleNamespace(
+        config = SimpleNamespace(layer_prefill_chunk_round_robin=False)
+        scheduler = _Scheduler(
             ps=SimpleNamespace(gpu_id=3),
         )
 
@@ -517,26 +506,31 @@ class TestPDMuxScheduler(unittest.TestCase):
                 return_value=[(1, 0), (1, 1), (0, 1)],
             ),
         ):
-            SchedulerMultiplexMixin.init_pdmux(scheduler)
+            with (
+                patch("torch.cuda.Stream", return_value=object()),
+                patch("torch.cuda.stream", return_value=nullcontext()),
+                patch(
+                    "sglang.srt.multiplex.multiplexing_mixin.get_device",
+                    return_value=SimpleNamespace(gpu_id=3),
+                ),
+            ):
+                SchedulerMultiplexMixin.init_pdmux(scheduler)
 
         load_pdmux_config.assert_called_once_with("pdmux.yaml")
         initialize_stream_groups.assert_called_once_with(3, config)
         self.assertEqual(scheduler.real_sm_group_num, 3)
 
-    def test_pdmux_prefill_status_is_observable(self):
-        self.assertFalse(is_pdmux_prefill_enabled())
-
-        set_pdmux_status(True)
-        self.assertTrue(is_pdmux_prefill_enabled())
-
-        set_pdmux_status(False)
-        self.assertFalse(is_pdmux_prefill_enabled())
-
-    def test_pdmux_process_status_does_not_follow_prefill_phase(self):
-        with patch.object(parallel_state, "_PDMUX_PREFILL_TP_GROUP", object()):
-            set_pdmux_status(False)
-
+    def test_prefill_tp_group_is_scoped_and_restored(self):
+        decode_group, prefill_group = object(), object()
+        with (
+            get_parallel().override(tp_group=decode_group),
+            patch.object(parallel_state, "_PDMUX_PREFILL_TP_GROUP", prefill_group),
+        ):
             self.assertTrue(is_pdmux_enabled())
+            with pdmux_prefill_tp_group():
+                self.assertIs(get_parallel().tp_group, prefill_group)
+                self.assertTrue(is_pdmux_prefill_enabled())
+            self.assertIs(get_parallel().tp_group, decode_group)
             self.assertFalse(is_pdmux_prefill_enabled())
 
     def _make_merge_streams(self, operations):
@@ -565,7 +559,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             ("merge", batch)
         )
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=None,
@@ -608,7 +602,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         running_batch.is_empty.return_value = True
         running_batch.batch_is_full = True
         prefill_stream, decode_stream, merge_done = self._make_merge_streams([])
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=None,
@@ -652,7 +646,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             ("merge", batch)
         )
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=chunked_req,
@@ -694,11 +688,9 @@ class TestPDMuxScheduler(unittest.TestCase):
         split_batch.batch_size.side_effect = [1, 0]
         split_batch.is_empty.return_value = True
         running_batch = Mock()
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[waiting_req],
             tree_cache=object(),
             running_batch=running_batch,
@@ -734,11 +726,9 @@ class TestPDMuxScheduler(unittest.TestCase):
 
     def test_merge_keeps_continuation_when_round_robin_is_disabled(self):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=False
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=False),
             waiting_queue=[object()],
             chunked_req=chunked_req,
         )
@@ -752,11 +742,9 @@ class TestPDMuxScheduler(unittest.TestCase):
 
     def test_round_robin_keeps_continuation_when_no_request_is_waiting(self):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[],
             chunked_req=chunked_req,
         )
@@ -770,11 +758,9 @@ class TestPDMuxScheduler(unittest.TestCase):
 
     def test_round_robin_requires_an_insertable_prefix_cache(self):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             pdmux_standard=False,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[object()],
             tree_cache=SimpleNamespace(disable=True),
             chunked_req=chunked_req,
@@ -794,11 +780,9 @@ class TestPDMuxScheduler(unittest.TestCase):
 
     def test_round_robin_is_scoped_to_layer_prefill(self):
         chunked_req = _make_chunked_req(extend_end=32, prefix_len=16)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             pdmux_standard=True,
-            pdmux_config=SimpleNamespace(
-                layer_prefill_chunk_round_robin=True
-            ),
+            pdmux_config=SimpleNamespace(layer_prefill_chunk_round_robin=True),
             waiting_queue=[object()],
             chunked_req=chunked_req,
         )
@@ -812,9 +796,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
     def test_chunk_round_robin_restores_fifo_after_policy_sort(self):
         first, second, continuation = object(), object(), object()
-        scheduler = SimpleNamespace(
-            waiting_queue=[continuation, second, first]
-        )
+        scheduler = _Scheduler(waiting_queue=[continuation, second, first])
 
         SchedulerMultiplexMixin._pdmux_restore_chunk_round_robin_order(
             scheduler, [first, second, continuation]
@@ -837,7 +819,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         running_batch = Mock()
         running_batch.batch_is_full = True
         prefill_stream, decode_stream, merge_done = self._make_merge_streams(operations)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=chunked_req,
@@ -873,7 +855,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         split_batch.is_empty.return_value = True
         running_batch = Mock()
         prefill_stream, decode_stream, _ = self._make_merge_streams([])
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             running_batch=running_batch,
             split_prefill_batch=split_batch,
             chunked_req=chunked_req,
@@ -899,7 +881,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         pending chunked aborts itself; without this an aborted chunked request
         leaks its KV forever."""
         running_batch = _Batch(empty=True)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             split_prefill_batch=None,
             process_pending_chunked_abort=Mock(),
             get_new_batch_prefill=Mock(
@@ -931,7 +913,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=Mock(return_value=idle_batch)
         )
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             split_prefill_batch=None,
             process_pending_chunked_abort=Mock(),
             get_new_batch_prefill=Mock(
@@ -960,7 +942,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         """Tearing down a chunked request while its split forward is running
         is unsafe; the abort must wait for the between-chunks safe point."""
         running_batch = _Batch(empty=True)
-        scheduler = SimpleNamespace(
+        scheduler = _Scheduler(
             split_prefill_batch=Mock(),
             process_pending_chunked_abort=Mock(),
         )

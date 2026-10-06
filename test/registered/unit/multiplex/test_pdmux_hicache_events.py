@@ -21,6 +21,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -61,6 +62,7 @@ class _DecodeBatch:
     """A non-empty decode batch, so split prefill advances one layer at a time."""
 
     batch_is_full = False
+    scheduler_global_num_tokens = None
 
     def is_empty(self):
         return False
@@ -73,10 +75,11 @@ class _SplitBatch:
     def __init__(self):
         self.split_index = 0
         self.extend_num_tokens = 1000
+        self.scheduler_global_num_tokens = None
         self.split_forward_count = 0
         self.split_prefill_finished = False
         self.chunked_req = None
-        self.forward_mode = None
+        self.forward_mode = ForwardMode.EXTEND
         self.hicache_consumer_index = CONSUMER_INDEX
 
     def is_empty(self):
@@ -117,9 +120,14 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.stream_groups = [(stream, stream)]
         self.sm_counts = [(1, 1)]
 
-        self.request_receiver = SimpleNamespace(recv_requests=self._recv_requests)
+        self.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
 
     # --- collaborators the loop drives -------------------------------------
+
+    def ingest_requests(self):
+        self.process_input_requests(self._recv_requests())
 
     def _recv_requests(self):
         self.iteration += 1
@@ -169,8 +177,12 @@ def _stubbed_cuda():
         patch("torch.cuda.stream", lambda _stream: contextlib.nullcontext()),
         patch("torch.cuda.empty_cache", lambda: None),
         patch(
-            "sglang.srt.multiplex.multiplexing_mixin.set_pdmux_status",
-            lambda _enabled: None,
+            "sglang.srt.multiplex.multiplexing_mixin.get_parallel",
+            return_value=SimpleNamespace(tp_size=1),
+        ),
+        patch(
+            "sglang.srt.multiplex.multiplexing_mixin.pdmux_prefill_tp_group",
+            lambda: contextlib.nullcontext(),
         ),
         patch(
             "sglang.srt.multiplex.multiplexing_mixin.get_current_stream_idx",
@@ -248,6 +260,30 @@ class TestPDMuxHiCacheEvents(unittest.TestCase):
         scheduler = _run_loop(max_iterations=4, query_results=[False], pump_interval=2)
 
         self.assertEqual(scheduler.pumps, [0, 2])
+
+
+class TestPDMuxBufferedHiCacheDeviceWork(unittest.TestCase):
+    def test_buffered_load_ack_requires_decode_dependency_without_storage_work(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        for load_count in (0, 1):
+            with self.subTest(load_count=load_count):
+                cache = SimpleNamespace(
+                    linker=None,
+                    _drain_async_work=Mock(),
+                    flush_pending_backups=Mock(),
+                    cache_controller=SimpleNamespace(write_policy="write_through"),
+                    _sync_hicache_ready_counts=lambda: (0, load_count, [], []),
+                    writing_check=Mock(),
+                    loading_check=Mock(),
+                    enable_storage=False,
+                    enable_storage_metrics=False,
+                    buffer_pipeline=SimpleNamespace(flush_pending_writes=Mock()),
+                )
+                self.assertEqual(
+                    UnifiedRadixCache.check_hicache_events(cache), load_count > 0
+                )
+                cache.loading_check.assert_called_once_with(finish_count=load_count)
 
 
 if __name__ == "__main__":

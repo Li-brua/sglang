@@ -698,7 +698,7 @@ class Sampler(nn.Module):
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
             group = (
-                get_tp_group().device_group
+                get_parallel().tp_group.device_group
                 if self._resolve_tp_sync_group_per_call
                 else self.tp_sync_group
             )

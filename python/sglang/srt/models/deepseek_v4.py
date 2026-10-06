@@ -133,7 +133,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
@@ -179,6 +178,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -4520,13 +4520,17 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        split_interval: Optional[Tuple[int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
-        hash_ids = None
+        split_state = (
+            forward_batch.model_specific_states if split_interval is not None else {}
+        )
+        hash_ids = split_state.get("hash_ids")
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
-        if self.engram_hasher is not None:
+        if self.engram_hasher is not None and hash_ids is None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
@@ -4550,20 +4554,22 @@ class DeepseekV4Model(nn.Module):
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
         tail = None
         if (
-            self.late_layer_start is not None
+            split_interval is None
+            and self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
-        prev_pre = None
-        precomputed_attn = None
-        combined_attn = None
-        normalized_attn = None
+        prev_pre = split_state.get("prev_pre")
+        precomputed_attn = split_state.get("precomputed_attn")
+        combined_attn = split_state.get("combined_attn")
+        normalized_attn = split_state.get("normalized_attn")
         # HIP: the fused boundary hands the next layer its FFN hc_post unapplied
-        pending_post = None
-        for i in range(self.start_layer, self.end_layer):
+        pending_post = split_state.get("pending_post")
+        layer_start, layer_end = split_interval or (self.start_layer, self.end_layer)
+        for i in range(layer_start, layer_end):
             if tail is not None and i == self.late_layer_start:
                 combined_attn = None
                 normalized_attn = None
@@ -4705,6 +4711,15 @@ class DeepseekV4Model(nn.Module):
             precomputed_attn = next_input[0] if next_input else None
             combined_attn, normalized_attn = (
                 next_combined[0] if next_combined else (None, None)
+            )
+        if split_interval is not None:
+            split_state.update(
+                hash_ids=hash_ids,
+                prev_pre=prev_pre,
+                precomputed_attn=precomputed_attn,
+                combined_attn=combined_attn,
+                normalized_attn=normalized_attn,
+                pending_post=pending_post,
             )
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
@@ -5002,7 +5017,9 @@ class DeepseekV4Model(nn.Module):
         start, end = split_interval
 
         if start == 0:
-            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
             if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
@@ -5019,13 +5036,7 @@ class DeepseekV4Model(nn.Module):
                 )
                 input_ids_global = input_ids_global.squeeze(-1)
             else:
-                input_ids_global = input_ids
-
-            if dsa_use_prefill_cp(forward_batch):
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-                positions = cp_split_and_rebuild_position(forward_batch, positions)
-                input_ids = cp_round_robin_input_ids(input_ids)
-                input_ids_global = input_ids
+                input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
             for attr in ("freqs_cis_c4", "freqs_cis_c128"):
                 if hasattr(forward_batch, attr):
@@ -5053,33 +5064,45 @@ class DeepseekV4Model(nn.Module):
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states = states["dspark_aux_hidden_states"]
 
-        for i in range(start, end):
-            layer = self.layers[i]
-            last_layer = layer
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
+        if self.hc_pre_from_prev_sublayer:
+            hidden_states, _, _ = self._forward_layers_hc_pre_from_prev(
+                states["positions"],
+                hidden_states,
+                forward_batch,
+                states["input_ids"],
+                states["input_ids_global"],
+                capture_dspark,
+                dspark_aux_hidden_states,
+                split_interval=split_interval,
             )
-            with ctx:
-                hidden_states, prev_residual, prev_post, prev_comb = layer(
-                    positions=states["positions"],
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    input_ids=states["input_ids"],
-                    input_ids_global=states["input_ids_global"],
-                    prev_residual=prev_residual,
-                    prev_post=prev_post,
-                    prev_comb=prev_comb,
+        else:
+            for i in range(start, end):
+                layer = self.layers[i]
+                last_layer = layer
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
-            if capture_dspark and i in self.dspark_layers_to_capture:
-                if self.use_fused_mhc_post_pre:
-                    completed = layer.hc_post(
-                        hidden_states, prev_residual, prev_post, prev_comb
+                with ctx:
+                    hidden_states, prev_residual, prev_post, prev_comb = layer(
+                        positions=states["positions"],
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=states["input_ids"],
+                        input_ids_global=states["input_ids_global"],
+                        prev_residual=prev_residual,
+                        prev_post=prev_post,
+                        prev_comb=prev_comb,
                     )
-                else:
-                    completed = hidden_states
-                dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if capture_dspark and i in self.dspark_layers_to_capture:
+                    if self.use_fused_mhc_post_pre:
+                        completed = layer.hc_post(
+                            hidden_states, prev_residual, prev_post, prev_comb
+                        )
+                    else:
+                        completed = hidden_states
+                    dspark_aux_hidden_states.append(completed.mean(dim=1))
 
         forward_batch.hidden_states = hidden_states
         states["prev_residual"] = prev_residual
@@ -5094,26 +5117,20 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, prev_residual, prev_post, prev_comb
             )
 
-        if dsa_use_prefill_cp(forward_batch):
-            stream = torch.cuda.current_stream()
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                stream,
-            )
-            if capture_dspark:
-                dspark_aux_hidden_states = [
-                    cp_all_gather_rerange_output(
-                        aux, self.cp_size, forward_batch, stream
-                    )
-                    for aux in dspark_aux_hidden_states
-                ]
-
         pre_hc_head = hidden_states.flatten(1)
-        hidden_states = self.hc_head(
-            hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-        )
+        if self.hc_pre_from_prev_sublayer:
+            from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+            hidden_states = hc_combine(
+                pre_hc_head.float(),
+                states["prev_pre"],
+                self.hc_mult,
+                hidden_states.dtype,
+            )
+        else:
+            hidden_states = self.hc_head(
+                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+            )
         hidden_states = self.norm(hidden_states)
         forward_batch.hidden_states = hidden_states
         if capture_dspark:
@@ -5438,6 +5455,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         split_interval: Tuple[int, int],
         input_embeds: Optional[torch.Tensor] = None,
     ):
+        if self.vision is not None:
+            if split_interval[0] == 0:
+                if forward_batch.mm_inputs is not None and any(
+                    x is not None for x in forward_batch.mm_inputs
+                ):
+                    if input_embeds is not None:
+                        raise ValueError("Cannot combine input_embeds and image inputs")
+                    input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
+                input_ids = input_ids.masked_fill(
+                    input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+                )
+            else:
+                input_ids = forward_batch.model_specific_states["input_ids"]
+
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward_split_prefill(
                 input_ids,

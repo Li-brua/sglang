@@ -2213,7 +2213,10 @@ def pdmux_prefill_tp_group():
 
 
 def is_pdmux_prefill_enabled() -> bool:
-    return _ENABLE_PDMUX_P_TP
+    return (
+        _PDMUX_PREFILL_TP_GROUP is not None
+        and get_parallel().tp_group is _PDMUX_PREFILL_TP_GROUP
+    )
 
 
 def is_pdmux_enabled() -> bool:

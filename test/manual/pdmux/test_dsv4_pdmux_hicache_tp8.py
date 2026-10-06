@@ -24,14 +24,13 @@ from __future__ import annotations
 
 import os
 import unittest
-
-from sglang.test.test_utils import CustomTestCase
-
 from test.manual.pdmux.test_pdmux_hicache import (
     SPLIT_FORWARD_TOKEN_BUDGET,
     PDMuxHiCacheMixin,
     sm_multiple,
 )
+
+from sglang.test.test_utils import CustomTestCase
 
 DSV4_FLASH_MODEL_PATH = os.environ.get(
     "SGLANG_TEST_DSV4_FLASH_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"

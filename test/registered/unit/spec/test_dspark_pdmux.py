@@ -12,6 +12,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestDSparkPDMux(unittest.TestCase):
     def test_scheduler_pp_proxy_argument_is_accepted_for_decode(self):
         worker = object.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
+        worker.enable_dp_spec_prefill_coordination = False
         worker._forward_decode = Mock(return_value="decoded")
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_extend=lambda: False),
@@ -26,6 +28,8 @@ class TestDSparkPDMux(unittest.TestCase):
 
     def test_scheduler_pp_proxy_argument_reaches_target_prefill(self):
         worker = object.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
+        worker.enable_dp_spec_prefill_coordination = False
         worker._verify_planner = SimpleNamespace(note_non_decode_step=Mock())
         worker._observers = SimpleNamespace(note_prefill_step=Mock())
         worker._forward_prefill = Mock(return_value="prefilled")
@@ -61,12 +65,17 @@ class TestDSparkPDMux(unittest.TestCase):
                 "get_schedule",
                 return_value=SimpleNamespace(page_size=256),
             ),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
+                return_value=SimpleNamespace(
+                    pp_group=SimpleNamespace(is_last_rank=True)
+                ),
+            ),
             self.assertRaisesRegex(NotImplementedError, "auxiliary hidden states"),
         ):
             DSparkWorkerV2(
                 server_args=SimpleNamespace(),
                 gpu_id=0,
-                ps=SimpleNamespace(),
                 nccl_port=0,
                 target_worker=target_worker,
             )
@@ -129,6 +138,8 @@ class TestDSparkPDMux(unittest.TestCase):
 
     def test_stream_switch_updates_target_and_draft_runners(self):
         worker = object.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
+        worker.enable_dp_spec_prefill_coordination = False
         worker.model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
         worker.draft_model_runner = SimpleNamespace(update_decode_attn_backend=Mock())
 

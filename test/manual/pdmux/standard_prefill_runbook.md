@@ -314,4 +314,6 @@ that moment, which the debug log reports on every switch
 - DSV4 and the DSpark draft run their single-stream paths (no model-internal
   helper streams).
 - Rejected at launch: a non-disabled prefill CUDA graph, multi-layer EAGLE,
-  TBO, unified memory, DP attention, EP, CP, DCP.
+  TBO, unified memory, EP, CP, DCP.
+- Attention DP is supported. Preparation reuse applies to `layer_split`;
+  the standard lane runs one ordinary EXTEND per prefill.

@@ -1097,7 +1097,8 @@ struct TopKKernel {
     };
     dispatch([&]<TopKMode kMode>() {
 #if SUPPORT_CLUSTER
-      const bool use_cluster = enable_cluster && (max_seq_len > params.static_cluster_floor) && (batch_size <= kClusterMaxBatch);
+      const bool use_cluster =
+          enable_cluster && (max_seq_len > params.static_cluster_floor) && (batch_size <= kClusterMaxBatch);
       if (use_cluster) {
         if constexpr (kMaxCluster16BatchSize > 0) {
           if (batch_size <= kMaxCluster16BatchSize) {

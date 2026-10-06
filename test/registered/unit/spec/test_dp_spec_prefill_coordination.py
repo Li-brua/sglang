@@ -321,6 +321,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                 worker._target_worker = SimpleNamespace(forward_batch_generation=target)
                 worker._draft_worker = SimpleNamespace(
                     draft_runner=SimpleNamespace(),
+                    prefill_lane_draft_extend_backend=contextlib.nullcontext,
                     draft_owns_attention=bool(rank % 2),
                     draft=draft,
                     _draft_extend_for_prefill=extend,

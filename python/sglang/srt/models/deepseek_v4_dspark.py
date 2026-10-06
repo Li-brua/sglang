@@ -36,7 +36,6 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
@@ -54,6 +53,7 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
     run_markov_block,
 )
+from sglang.srt.multiplex.pdmux_context import is_pdmux_standard_prefill
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,

@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -18,30 +18,40 @@ class TestDeepseekV4TopKDispatch(unittest.TestCase):
         out = torch.empty((1, 1), dtype=torch.int32)
         metadata = torch.empty((2, 2), dtype=torch.int32)
 
-        with patch(
-            "sglang.kernels.ops.attention.dsv4.topk._jit_topk_v2_module",
-            return_value=module,
-        ):
-            topk_transform_512_v2(
-                scores,
-                seq_lens,
-                page_table,
-                out,
-                256,
-                metadata,
-                enable_cluster=False,
-            )
-
-        module.topk_transform.assert_called_once_with(
-            scores,
-            seq_lens,
-            page_table,
-            out,
-            256,
-            metadata,
-            None,
-            False,
-        )
+        raw_indices = torch.empty_like(out)
+        for pdmux_enabled, requested_cluster in ((False, False), (True, True)):
+            with self.subTest(pdmux_enabled=pdmux_enabled):
+                module.reset_mock()
+                with (
+                    patch(
+                        "sglang.kernels.ops.attention.dsv4.topk._jit_topk_v2_module",
+                        return_value=module,
+                    ),
+                    patch(
+                        "sglang.kernels.ops.attention.dsv4.topk.is_pdmux_enabled",
+                        return_value=pdmux_enabled,
+                    ),
+                ):
+                    topk_transform_paged_v2(
+                        scores,
+                        seq_lens,
+                        page_table,
+                        out,
+                        256,
+                        metadata,
+                        out_raw_indices=raw_indices,
+                        enable_cluster=requested_cluster,
+                    )
+                module.topk_transform_paged.assert_called_once_with(
+                    scores,
+                    seq_lens,
+                    page_table,
+                    out,
+                    256,
+                    metadata,
+                    raw_indices,
+                    False,
+                )
 
 
 if __name__ == "__main__":
