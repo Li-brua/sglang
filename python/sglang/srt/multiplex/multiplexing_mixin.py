@@ -150,7 +150,7 @@ class SchedulerMultiplexMixin:
         # have no active-batch owner and can deadlock admission under pressure.
         # Release only the request ownership (the cached prefix remains), then
         # re-admit it from the tail with a fresh match and lock.
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_chunked_requeue()
         if req not in self.waiting_queue:
             self.waiting_queue.append(req)

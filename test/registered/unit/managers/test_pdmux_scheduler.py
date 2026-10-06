@@ -705,6 +705,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         prefill_stream, decode_stream, _ = self._make_merge_streams([])
         with patch(
             "sglang.srt.multiplex.multiplexing_mixin.release_kv_cache",
+            autospec=True,
             side_effect=lambda *args, **kwargs: operations.append("release"),
         ) as release:
             SchedulerMultiplexMixin._merge_finished_prefill_batch(
@@ -720,7 +721,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertEqual(operations, ["stash", "release", "reset"])
         scheduler.stash_chunked_request.assert_called_once_with(chunked_req)
         release.assert_called_once_with(
-            chunked_req, scheduler.tree_cache, is_insert=False
+            chunked_req, scheduler.tree_cache, checkpoint=False
         )
         chunked_req.reset_for_chunked_requeue.assert_called_once_with()
 
