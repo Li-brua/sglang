@@ -173,10 +173,6 @@ class SchedulerMultiplexMixin:
             1,
             self.pdmux_config.split_forward_token_budget // prefill_num_tokens,
         )
-        if self.pdmux_config.max_split_forward_layers:
-            forward_count = min(
-                forward_count, self.pdmux_config.max_split_forward_layers
-            )
         return min(forward_count, remaining_layers)
 
     def _merge_finished_prefill_batch(
@@ -428,6 +424,7 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and not has_decode
                 )
                 if not has_decode and self.split_prefill_batch is None:
+                    self._sched_idled = True
                     self.on_idle()
 
             if adjust_stream_group:

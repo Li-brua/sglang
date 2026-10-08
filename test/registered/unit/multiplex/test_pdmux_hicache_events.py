@@ -105,9 +105,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         self.HICACHE_PUMP_INTERVAL = pump_interval
 
         self.model_config = SimpleNamespace(num_hidden_layers=NUM_LAYERS)
-        self.pdmux_config = SimpleNamespace(
-            split_forward_token_budget=1000, max_split_forward_layers=0
-        )
+        self.pdmux_config = SimpleNamespace(split_forward_token_budget=1000)
         self.ps = SimpleNamespace(tp_size=1)
         self.tp_cpu_group = SimpleNamespace(
             allreduce=lambda tensor, op: SimpleNamespace(wait=lambda: None)
@@ -213,6 +211,20 @@ def _run_loop(*, max_iterations, query_results, pump_interval=1):
 
 
 class TestPDMuxHiCacheEvents(unittest.TestCase):
+    def test_fully_idle_iteration_marks_the_gap_before_idle_handling(self):
+        scheduler = _FakeScheduler(max_iterations=1, query_results=[])
+        scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
+        scheduler.pending_split_batch = None
+        scheduler._sched_idled = False
+        idle_states = []
+        scheduler.on_idle = lambda: idle_states.append(scheduler._sched_idled)
+
+        with _stubbed_cuda():
+            with self.assertRaises(_LoopFinished):
+                scheduler.event_loop_pdmux()
+
+        self.assertEqual(idle_states, [True])
+
     def test_stream_switch_uses_synced_idle_decode_participant(self):
         scheduler = _FakeScheduler(max_iterations=1, query_results=[])
         scheduler.stream_groups.append(scheduler.stream_groups[0])
@@ -228,6 +240,7 @@ class TestPDMuxHiCacheEvents(unittest.TestCase):
             return_value=(1, scheduler.stream_groups[1])
         )
         scheduler.on_idle = Mock()
+        scheduler._sched_idled = False
 
         with _stubbed_cuda():
             with self.assertRaises(_LoopFinished):
@@ -241,6 +254,7 @@ class TestPDMuxHiCacheEvents(unittest.TestCase):
         # stream decision must not introduce another DP collective.
         self.assertEqual(prepare.call_count, 2)
         scheduler.on_idle.assert_not_called()
+        self.assertFalse(scheduler._sched_idled)
 
     def test_every_iteration_pumps_hicache_events_exactly_once(self):
         """At interval 1, one pump per iteration across all formation states.
