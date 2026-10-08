@@ -57,9 +57,7 @@ class TestPDMuxScheduler(unittest.TestCase):
     ):
         return SimpleNamespace(
             model_config=SimpleNamespace(num_hidden_layers=61),
-            pdmux_config=SimpleNamespace(
-                split_forward_token_budget=token_budget, max_split_forward_layers=0
-            ),
+            pdmux_config=SimpleNamespace(split_forward_token_budget=token_budget),
             running_batch=_Batch(decode_empty),
             split_prefill_batch=SimpleNamespace(
                 split_index=split_index,
@@ -102,14 +100,13 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         self.assertEqual(count, 2)
 
-    def test_layer_cap_bounds_short_prefill_submission(self):
+    def test_short_prefill_uses_token_budget_without_a_layer_cap(self):
         scheduler = self._make_scheduler(decode_empty=False, extend_num_tokens=2048)
-        scheduler.pdmux_config.max_split_forward_layers = 2
         decode_batch = SimpleNamespace(scheduler_global_num_tokens=[1])
 
         self.assertEqual(
             SchedulerMultiplexMixin._get_split_forward_count(scheduler, decode_batch),
-            2,
+            32,
         )
         # Without decode there is no TPOT to protect; finish all remaining layers.
         self.assertEqual(
