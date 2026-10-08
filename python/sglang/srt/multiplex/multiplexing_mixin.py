@@ -173,6 +173,10 @@ class SchedulerMultiplexMixin:
             1,
             self.pdmux_config.split_forward_token_budget // prefill_num_tokens,
         )
+        if self.pdmux_config.max_split_forward_layers:
+            forward_count = min(
+                forward_count, self.pdmux_config.max_split_forward_layers
+            )
         return min(forward_count, remaining_layers)
 
     def _merge_finished_prefill_batch(
