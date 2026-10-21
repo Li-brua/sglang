@@ -191,11 +191,12 @@ class TestMambaRatioEnvGate(unittest.TestCase):
                 ):
                     for node in nodes.values():
                         req = SimpleNamespace(
-                            lock=TreeLock(node.id, DecLockRefParams(node_id=node.id))
+                            lock=TreeLock(node.id, DecLockRefParams(node_id=node.id)),
+                            kv=SimpleNamespace(mamba_cache_reserve_slot=None),
                         )
                         released = len(full.released)
                         self.assertEqual(cache.allocator.free_ids, [])
-                        self.assertIsNotNone(component._alloc_mamba_slot(req))
+                        self.assertIsNotNone(component._take_mamba_cache_slot(req))
                         self.assertEqual(
                             node.component_data[ComponentType.MAMBA].lock_ref, 0
                         )

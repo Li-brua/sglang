@@ -19,6 +19,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 def make_pool(free, *, lazy=False, extra_buffer=True, track_buffer_size=2):
     pool = object.__new__(HybridReqToTokenPool)
     pool.mamba_allocator = MambaSlotAllocator(5, "cpu")
+    pool.mamba_ckpt_pool = None
     pool.enable_mamba_extra_buffer = extra_buffer
     pool.enable_mamba_extra_buffer_lazy = lazy
     pool.mamba_ping_pong_track_buffer_size = track_buffer_size
@@ -33,7 +34,11 @@ def make_pool(free, *, lazy=False, extra_buffer=True, track_buffer_size=2):
 
 def make_req(*, holds_mamba=False, has_buffer=False):
     return SimpleNamespace(
+        skip_radix_cache_insert=False,
         kv=SimpleNamespace(
+            mamba_prefill_live_slot=None,
+            mamba_prefill_ping_pong_slots=None,
+            mamba_cache_reserve_slot=None,
             holds_mamba=holds_mamba,
             mamba_ping_pong_track_buffer=object() if has_buffer else None,
             req_pool_idx=None,
@@ -160,7 +165,10 @@ class TestMambaCapacity(unittest.TestCase):
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(alloc_req_slots(pool, [req], cache), [1])
-        pool.alloc.assert_called_once_with([req])
+        pool.alloc.assert_called_once_with([req], reserve_mamba_cache_slot=True)
+        pool.alloc.reset_mock()
+        self.assertEqual(alloc_req_slots(pool, [req], None), [1])
+        pool.alloc.assert_called_once_with([req], reserve_mamba_cache_slot=False)
 
     def test_uses_only_missing_slots_for_each_request(self):
         pool, held = make_pool(2)

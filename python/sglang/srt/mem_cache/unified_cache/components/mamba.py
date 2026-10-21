@@ -561,7 +561,7 @@ class MambaComponent(TreeComponent):
         if slot is not None:
             req.kv.mamba_cache_reserve_slot = None
             return slot
-        return self._alloc_mamba_slot()
+        return self._alloc_mamba_slot(req)
 
     @property
     def int8_ckpt_pool(self):

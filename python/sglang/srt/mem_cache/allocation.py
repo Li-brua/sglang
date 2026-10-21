@@ -342,8 +342,10 @@ def alloc_req_slots(
         mamba_available_size = (
             req_to_token_pool.mamba_allocator.schedulable_available_size()
         )
-        reserve_cache_slot = tree_cache.supports_mamba() and not getattr(
-            tree_cache, "disable", False
+        reserve_cache_slot = (
+            tree_cache is not None
+            and tree_cache.supports_mamba()
+            and not getattr(tree_cache, "disable", False)
         )
         mamba_state_needed = sum(
             req_to_token_pool.mamba_slots_needed_for_extend(
