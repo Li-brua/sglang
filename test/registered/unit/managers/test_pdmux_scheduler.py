@@ -484,7 +484,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler.process_batch_result.assert_called_once_with(
             split_batch, prefill_result
         )
-        split_batch.filter_batch.assert_called_once_with(chunked_req_to_exclude=[])
+        split_batch.filter_batch.assert_called_once_with(reqs_to_exclude=[])
         self.assertTrue(running_batch.batch_is_full)
         self.assertEqual(
             operations,
@@ -572,7 +572,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         scheduler.stash_chunked_request.assert_called_once_with(chunked_req)
         (filter_op,) = [op for op in operations if op[0] == "filter"]
-        self.assertEqual(filter_op[1]["chunked_req_to_exclude"], [chunked_req])
+        self.assertEqual(filter_op[1]["reqs_to_exclude"], [chunked_req])
         self.assertFalse(running_batch.batch_is_full)
         self.assertEqual(
             [op[0] for op in operations],
@@ -650,7 +650,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         scheduler.stash_chunked_request.assert_not_called()
         split_batch.filter_batch.assert_called_once_with(
-            chunked_req_to_exclude=[chunked_req]
+            reqs_to_exclude=[chunked_req]
         )
 
     def test_chunk_stash_waits_for_mamba_slot_then_resumes(self):
@@ -755,7 +755,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             running_batch=running_batch,
         )
         self.assertIs(scheduler._pdmux_pending_chunk_stash_req, chunked_req)
-        batch.filter_batch.assert_called_once_with(chunked_req_to_exclude=[chunked_req])
+        batch.filter_batch.assert_called_once_with(reqs_to_exclude=[chunked_req])
         scheduler.stash_chunked_request.assert_not_called()
 
         created, _ = SchedulerMultiplexMixin.update_split_prefill_batch(

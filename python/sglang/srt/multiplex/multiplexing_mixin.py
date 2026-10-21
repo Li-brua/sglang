@@ -249,7 +249,7 @@ class SchedulerMultiplexMixin:
         # already released. Merging them into the decode batch leaves a freed
         # req_pool_idx registered as a live owner until the next filter.
         last_bs = batch.batch_size()
-        batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+        batch.filter_batch(reqs_to_exclude=list(chunked_req_to_exclude))
         if batch.batch_size() < last_bs:
             running_batch.batch_is_full = False
 
