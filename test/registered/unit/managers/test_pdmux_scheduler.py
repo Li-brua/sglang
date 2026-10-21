@@ -30,8 +30,8 @@ class _ChunkedReq:
     """Hashable stand-in for Req (the merge path stores it in a set)."""
 
     def __init__(self, *, extend_end, prefix_len):
-        self.extend_range = SimpleNamespace(end=extend_end)
-        self.prefix_indices = [0] * prefix_len
+        self.extend_end = extend_end
+        self.prefix_len = prefix_len
 
 
 def _make_chunked_req(*, extend_end, prefix_len):

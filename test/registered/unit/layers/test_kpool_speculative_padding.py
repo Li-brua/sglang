@@ -42,7 +42,7 @@ class TestKPoolSpeculativePadding(unittest.TestCase):
         plan = kpool_plan._alloc_kpool_write_plan_buffers(
             max_bs=batch.batch_size,
             num_draft_tokens=draft_tokens,
-            pool_size=4,
+            kpool=4,
             device=torch.device("cpu"),
             is_verify=True,
             is_v2=True,
@@ -58,7 +58,10 @@ class TestKPoolSpeculativePadding(unittest.TestCase):
             is_draft_worker=True,
             model_config=SimpleNamespace(),
             attn_tp_sequence_sharded=lambda num_tokens: False,
-            attn_backend=SimpleNamespace(get_cpu_graph_seq_len_fill_value=lambda: 1),
+            attn_backend=SimpleNamespace(
+                get_cpu_graph_seq_len_fill_value=lambda: 1,
+                late_layer_num_tokens=lambda batch: None,
+            ),
         )
         no_prefill_graph = SimpleNamespace(
             graph=SimpleNamespace(
@@ -94,7 +97,7 @@ class TestKPoolSpeculativePadding(unittest.TestCase):
         pool = SimpleNamespace(
             index_kpool=4,
             tail_extra_slots=draft_tokens,
-            slots_per_page=16,
+            index_page_size=16,
             index_head_dim=128,
             get_compress_tail_buffers=lambda layer: (
                 torch.zeros(4, 4 + draft_tokens, 128, dtype=torch.bfloat16),

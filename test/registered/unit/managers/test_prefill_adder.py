@@ -182,6 +182,7 @@ class TestPrefillAdder(CustomTestCase):
         pool.mamba_ckpt_pool = None
         pool.enable_mamba_extra_buffer_lazy = False
         pool.mamba_ping_pong_track_buffer_size = 1
+        pool.mamba_initial_tracking_slots = 1
         pool.mamba_allocator = MagicMock()
         pool.mamba_allocator.admission_available_size.return_value = 3
         cache = SimpleNamespace(
@@ -232,9 +233,11 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(adder._has_mamba_slots_for_req(matched))
 
         pool.mamba_ping_pong_track_buffer_size = 2
+        pool.mamba_initial_tracking_slots = 2
         self.assertEqual(adder._mamba_slots_needed_for_req(fresh), 4)
 
         adder.page_size = 1
+        adder.exact_chunk_fill = False
         adder.per_req_token_overhead = 1
         adder.memory_budget = MagicMock()
         adder.rem_mamba_slots = 4
@@ -243,6 +246,7 @@ class TestPrefillAdder(CustomTestCase):
         adder.dllm_config = None
         adder.log_hit_tokens = 0
         adder.log_input_tokens = 0
+        adder.log_replay_tokens = 0
         adder._update_prefill_budget(
             prefix_len=0,
             extend_input_len=1,

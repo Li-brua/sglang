@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,

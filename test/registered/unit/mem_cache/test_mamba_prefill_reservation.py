@@ -40,6 +40,7 @@ def _make_pool_and_req():
     pool.enable_mamba_extra_buffer = True
     pool.enable_mamba_extra_buffer_lazy = False
     pool.mamba_ping_pong_track_buffer_size = 1
+    pool.mamba_initial_tracking_slots = 1
     pool.mamba_ckpt_pool = None
     pool.mamba_pool = SimpleNamespace(
         replayssm_spec_write_pos=None, replayssm_write_pos=None
@@ -80,10 +81,11 @@ class TestMambaPrefillReservation(unittest.TestCase):
         adder.can_run_list = []
         adder.tree_cache = SimpleNamespace(req_to_token_pool=None)
         adder._mamba_slot_cost = 0
+        adder._request_slot_reserve_for_req = lambda *a, **kw: 0
         adder._has_mamba_slots_for_req = lambda req: False
         adder._kv_shard_reserve_scratch = lambda **kwargs: True
         req = SimpleNamespace(
-            prefix_indices=[0] * 16,
+            prefix_len=16,
             full_untruncated_fill_ids=[0] * 32,
             sampling_params=SimpleNamespace(max_new_tokens=16),
             output_ids=[],
@@ -148,9 +150,11 @@ class TestMambaPrefillReservation(unittest.TestCase):
         with patch.object(ReqToTokenPool, "alloc", return_value=[0]):
             pool.alloc([req], reserve_mamba_cache_slot=True)
         req.skip_radix_cache_insert = True
+        req.extend_end = 16
         req.finished = lambda: False
         cache = SimpleNamespace(req_to_token_pool=pool)
         checkpoint_kv_cache(req, cache)
+        self.assertEqual(req.prefix_len, req.extend_end)
         self.assertIsNone(req.kv.mamba_cache_reserve_slot)
         self.assertEqual(pool.mamba_allocator.available_size(), 1)
         pool.free_mamba_cache(req)

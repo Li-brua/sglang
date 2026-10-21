@@ -234,7 +234,7 @@ class SchedulerMultiplexMixin:
             # Stash only when this chunk produced new KV beyond what is
             # already cached. A parked chunk (add_chunked_req hybrid-SWA
             # early-return) has nothing new to cache.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 # Stash rewrites req_to_token, which the sparse-prefill
                 # scaffolding snapshots at segment 0. All segments have now run.
                 SchedulerMultiplexMixin._stash_chunked_request_when_ready(

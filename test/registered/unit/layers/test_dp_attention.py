@@ -141,7 +141,9 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
             _pad_inputs_to_size=lambda *args: None,
         )
         runner = SimpleNamespace(
-            is_draft_worker=False, attn_tp_sequence_sharded=lambda tokens: False
+            is_draft_worker=False,
+            attn_tp_sequence_sharded=lambda tokens: False,
+            attn_backend=SimpleNamespace(late_layer_num_tokens=lambda batch: None),
         )
         prefix = "sglang.srt.model_executor.forward_batch_info"
         with (

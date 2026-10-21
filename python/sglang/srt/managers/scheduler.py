@@ -3328,11 +3328,12 @@ class Scheduler(
                     storage_hit_end=storage_hit_end,
                 )
 
-    def _process_storage_prefetch_retries(self):
+    def _process_storage_prefetch_retries(self) -> bool:
         """Issue due L3 attempts in the current waiting-queue order."""
         retries = self.tree_cache.storage_prefetch_retries
         if retries is None:
-            return
+            return False
+        retried = False
         memory = get_memory()
         for req, storage_hit_end in retries.pop_ready(
             self.waiting_queue,
@@ -3340,6 +3341,8 @@ class Scheduler(
             memory.hicache_storage_prefetch_retry_max_attempts,
         ):
             self._retry_storage_prefetch(req, storage_hit_end)
+            retried = True
+        return retried
 
     def _retry_storage_prefetch(
         self, req: Req, storage_hit_end: Optional[int] = None
@@ -3815,7 +3818,7 @@ class Scheduler(
 
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
-    ) -> None:
+    ) -> bool:
         # The HiCache drain is TP-wide consensus; run it before rank-local
         # decisions (_should_defer_prefill) or ranks enter different collectives.
         if (
@@ -3824,9 +3827,14 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
-            self.tree_cache.check_hicache_events()
+            device_work = self.tree_cache.check_hicache_events()
+            # Legacy external cache implementations return None and may free
+            # failed-load pages. Conservatively publish their dependency.
+            device_work = device_work is None or bool(device_work)
             if self.enable_hicache_storage and should_retry_storage_prefetch:
-                self._process_storage_prefetch_retries()
+                device_work = self._process_storage_prefetch_retries() or device_work
+            return device_work
+        return False
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
@@ -4019,18 +4027,8 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def check_hicache_events_if_enabled(self) -> bool:
-        """Drain HiCache transfer acks, host locks, and prefetch progress.
-
-        Batch formation is the normal caller, so every scheduling loop must
-        either form a batch or call this itself. The gate is load-bearing:
-        the base `tree_cache` leaves `check_hicache_events` unimplemented.
-        Returns whether the pump may have enqueued DEVICE work (KV frees,
-        mapping writes) that the caller must publish to other streams --
-        ack retirement alone is host-only bookkeeping and returns False.
-        """
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
-            return bool(self.tree_cache.check_hicache_events())
-        return False
+        """Drain events and report allocator/mapping work for stream ordering."""
+        return self._process_hicache_events()
 
     def _release_unadmitted_mamba_state(self, req: Req) -> None:
         """Undo slot ownership acquired while examining a queued request."""

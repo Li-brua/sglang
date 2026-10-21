@@ -25,6 +25,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestEaglePDMux(unittest.TestCase):
+    def setUp(self):
+        runtime_model = patch(
+            "sglang.srt.model_executor.model_runner.get_model",
+            return_value=SimpleNamespace(override=lambda **kwargs: nullcontext()),
+        )
+        runtime_model.start()
+        self.addCleanup(runtime_model.stop)
+
     def make_worker(self, idle=False):
         worker = EAGLEWorkerV2.__new__(EAGLEWorkerV2)
         target = SimpleNamespace(
@@ -56,7 +64,9 @@ class TestEaglePDMux(unittest.TestCase):
             sampling_info=Mock(),
         )
         persistent = SimpleNamespace(
-            input_ids=torch.cat((ids, torch.tensor([99]))), split_index=0
+            input_ids=torch.cat((ids, torch.tensor([99]))),
+            split_index=0,
+            kv_loc_plan=object(),
         )
         hidden = torch.empty((0, 2)) if idle else torch.arange(8).reshape(4, 2).float()
         logits = SimpleNamespace(hidden_states=hidden, mm_input_embeds=None)
@@ -73,7 +83,8 @@ class TestEaglePDMux(unittest.TestCase):
         target.model_runner.sample = Mock(return_value=sampled)
         next_draft = object()
 
-        def draft(local_batch, target_hidden, next_ids, mm):
+        def draft(local_batch, target_hidden, next_ids, mm, *, kv_loc_plan=None):
+            self.assertIs(kv_loc_plan, persistent.kv_loc_plan)
             self.assertIs(target_hidden, hidden)
             self.assertIs(next_ids, sampled)
             self.assertEqual(
@@ -160,13 +171,16 @@ class TestEaglePDMux(unittest.TestCase):
     def test_ordinary_prefill_keeps_full_capture_and_publishes_seq_lens(self):
         worker, batch, _, _ = self.make_worker()
         worker.speculative_algorithm = SimpleNamespace(is_standalone=lambda: False)
-        output = SimpleNamespace(new_seq_lens=None)
+        output = SimpleNamespace(new_seq_lens=None, kv_loc_plan=None)
         worker._target_worker.forward_batch_generation = Mock(return_value=output)
         worker._draft_worker = None
         publish = Mock()
         self.assertIs(worker._forward_prefill_batch(batch, on_publish=publish), output)
         worker._target_worker.forward_batch_generation.assert_called_once_with(
-            batch, pp_proxy_tensors=None, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            pp_proxy_tensors=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_kv_loc_plan=False,
         )
         publish.assert_called_once_with(batch.seq_lens)
 
@@ -189,6 +203,7 @@ class TestEaglePDMux(unittest.TestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            moe_num_token_non_padded=None,
             input_ids=torch.tensor([1]),
             positions=torch.tensor([0]),
             batch_size=1,
@@ -247,6 +262,7 @@ class TestEaglePDMux(unittest.TestCase):
         ):
             with self.subTest(draft=draft, mode=mode):
                 runner = ModelRunner.__new__(ModelRunner)
+                runner.model = SimpleNamespace(shared_experts_config=None)
                 runner.is_draft_worker = draft
                 runner.device = "cuda"
                 runner.attn_backend = Mock()
@@ -258,7 +274,11 @@ class TestEaglePDMux(unittest.TestCase):
                 runner._prepare_eager_forward_batch = Mock()
                 runner._maybe_execute_deferred_mamba_cow_and_clear = Mock()
                 runner.pp_group = SimpleNamespace(is_last_rank=True)
-                batch = SimpleNamespace(forward_mode=mode, global_num_tokens_cpu=None)
+                batch = SimpleNamespace(
+                    forward_mode=mode,
+                    global_num_tokens_cpu=None,
+                    moe_num_token_non_padded=None,
+                )
                 with (
                     patch(
                         "sglang.srt.model_executor.model_runner.get_disagg",

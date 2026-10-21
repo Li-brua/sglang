@@ -132,7 +132,10 @@ class TestGlm5NextPDMux(unittest.TestCase):
     def test_idle_dp_rank_skips_split_prefill_attention_plan(self):
         runner = SimpleNamespace(
             attn_backend=Mock(),
-            model=SimpleNamespace(forward_split_prefill=Mock(return_value=None)),
+            model=SimpleNamespace(
+                forward_split_prefill=Mock(return_value=None),
+                shared_experts_config=None,
+            ),
             model_config=SimpleNamespace(num_hidden_layers=2),
             device_timer=None,
         )
@@ -143,9 +146,20 @@ class TestGlm5NextPDMux(unittest.TestCase):
             positions=torch.empty(0, dtype=torch.long),
         )
 
-        with patch(
-            "sglang.srt.model_executor.model_runner.device_timer_ctx",
-            return_value=nullcontext(),
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner.device_timer_ctx",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner.get_model",
+                return_value=SimpleNamespace(override=lambda **kw: nullcontext()),
+            ),
+            patch("sglang.srt.model_executor.model_runner.get_forward_context"),
+            patch(
+                "sglang.srt.model_executor.model_runner.forward_context",
+                return_value=nullcontext(),
+            ),
         ):
             result = ModelRunner.forward_split_prefill(runner, batch, forward_count=1)
 

@@ -804,9 +804,20 @@ class PrefillAdder:
             auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
         )
 
-    def _mamba_gap_budget_for_req(self, req: Req, *, include_host_hit: bool = False) -> int:
+    def _mamba_gap_budget_for_req(
+        self, req: Req, *, include_host_hit: bool = False
+    ) -> int:
         """Shared-gap bytes for all state slots allocated at this admission."""
-        return self._mamba_slots_needed_for_req(req) * self._mamba_slot_cost
+        if not self._mamba_slot_cost:
+            return 0
+        pool = getattr(self.tree_cache, "req_to_token_pool", None)
+        if isinstance(pool, HybridReqToTokenPool):
+            slots = self._mamba_slots_needed_for_req(req)
+        else:
+            slots = int(not req.kv.holds_mamba)
+            if include_host_hit:
+                slots += req.mamba_host_hit_length
+        return slots * self._mamba_slot_cost
 
     def _mamba_slots_needed_for_req(self, req: Req) -> int:
         pool = getattr(self.tree_cache, "req_to_token_pool", None)
